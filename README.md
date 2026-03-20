@@ -4,4 +4,4 @@ Link: https://messy-circle-aa4.notion.site/COL362-632-Assignment-3-Out-of-Core-Q
 
 This assignment is for COL362.
 
-Authors: Aditya Anand and Ahilaan Saxena (IIT Delhi)
+Authors: Aditya Aand and Ahilaan Saxena (IIT Delhi)
