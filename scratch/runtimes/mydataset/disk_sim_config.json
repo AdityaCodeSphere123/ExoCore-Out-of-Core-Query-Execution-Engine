@@ -1,0 +1,18 @@
+{
+  "disk_config": {
+    "block_size": 4096,
+    "rpm": 7200.0,
+    "blocks_per_track": 1024,
+    "heads_per_cylinder": 4,
+    "total_cylinders": 500000,
+    "track_to_track_seek_ms": 0.8,
+    "full_stroke_seek_ms": 18.0,
+    "transfer_rate_mb_s": 150.0
+  },
+  "files": [
+    {
+      "id": "users",
+      "file_path": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/scratch/compiled_datasets/mydataset/users.bin"
+    }
+  ]
+}

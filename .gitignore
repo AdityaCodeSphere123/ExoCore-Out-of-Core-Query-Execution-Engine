@@ -1,0 +1,4 @@
+scratch/datasets/
+scratch/compiled_datasets/
+/target/
+.DS_Store

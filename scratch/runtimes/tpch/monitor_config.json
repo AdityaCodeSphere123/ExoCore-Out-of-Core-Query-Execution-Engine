@@ -1,0 +1,38 @@
+{
+  "disk_config": {
+    "disk_prog": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/my-awesome-db/target/release/disk",
+    "disk_prog_config": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/scratch/runtimes/tpch/disk_sim_config.json"
+  },
+  "database_config": {
+    "database_prog": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/my-awesome-db/target/release/database",
+    "database_prog_config": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/scratch/runtimes/tpch/db_config.json"
+  },
+  "query_configs": [
+    {
+      "execution_name": "simple_scan",
+      "disabled": false,
+      "query": {
+        "root": {
+          "Scan": {
+            "table_id": "customer"
+          }
+        }
+      },
+      "expected_output_file": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/scratch/runtimes/tpch/expected_1.csv",
+      "memory_limit_mb": 64
+    },
+    {
+      "execution_name": "Another Simple Scan",
+      "disabled": true,
+      "query": {
+        "root": {
+          "Scan": {
+            "table_id": "TableB"
+          }
+        }
+      },
+      "expected_output_file": "/Users/aditya/Desktop/Work/Out-of-Core-Query-Execution/scratch/runtimes/tpch/expected_2.csv",
+      "memory_limit_mb": 64
+    }
+  ]
+}

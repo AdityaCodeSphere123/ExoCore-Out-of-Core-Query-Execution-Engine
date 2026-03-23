@@ -1,0 +1,143 @@
+{
+  "table_specs": [
+    {
+      "name": "users",
+      "file_id": "users",
+      "column_specs": [
+        {
+          "column_name": "id",
+          "data_type": "Int32",
+          "stats": [
+            "IsPhysicallyOrdered",
+            {
+              "RangeStat": {
+                "lower_bound": {
+                  "Int32": 1
+                },
+                "upper_bound": {
+                  "Int32": 2
+                }
+              }
+            },
+            {
+              "CardinalityStat": 2
+            },
+            {
+              "DensityStat": 1.0
+            },
+            {
+              "HistogramStat": {
+                "frequency_points": [
+                  [
+                    {
+                      "lower_bound": {
+                        "Int32": 1
+                      },
+                      "upper_bound": {
+                        "Int32": 1
+                      }
+                    },
+                    1
+                  ],
+                  [
+                    {
+                      "lower_bound": {
+                        "Int32": 2
+                      },
+                      "upper_bound": {
+                        "Int32": 2
+                      }
+                    },
+                    1
+                  ]
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "column_name": "name",
+          "data_type": "String",
+          "stats": [
+            "IsPhysicallyOrdered",
+            {
+              "CardinalityStat": 2
+            },
+            {
+              "DensityStat": 1.0
+            },
+            {
+              "HistogramStat": {
+                "frequency_points": [
+                  [
+                    {
+                      "lower_bound": {
+                        "String": "Alice"
+                      },
+                      "upper_bound": {
+                        "String": "Alice"
+                      }
+                    },
+                    1
+                  ],
+                  [
+                    {
+                      "lower_bound": {
+                        "String": "Bob"
+                      },
+                      "upper_bound": {
+                        "String": "Bob"
+                      }
+                    },
+                    1
+                  ]
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "column_name": "job",
+          "data_type": "String",
+          "stats": [
+            "IsPhysicallyOrdered",
+            {
+              "CardinalityStat": 2
+            },
+            {
+              "DensityStat": 1.0
+            },
+            {
+              "HistogramStat": {
+                "frequency_points": [
+                  [
+                    {
+                      "lower_bound": {
+                        "String": "Engineer"
+                      },
+                      "upper_bound": {
+                        "String": "Engineer"
+                      }
+                    },
+                    1
+                  ],
+                  [
+                    {
+                      "lower_bound": {
+                        "String": "Manager"
+                      },
+                      "upper_bound": {
+                        "String": "Manager"
+                      }
+                    },
+                    1
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
