@@ -14,7 +14,7 @@
       "query": {
         "root": {
           "Scan": {
-            "table_id": "customer"
+            "table_id": "nation"
           }
         }
       },
