@@ -8,13 +8,16 @@ use crate::{
     cli::CliOptions,
     io_setup::{setup_disk_io, setup_monitor_io},
 };
-use crate::buffer::BlockBuffer;
+use crate::buffer_manager::BufferManager;
 
 mod cli;
 mod disk;
 mod executor;
 mod buffer;
 mod buffer_manager;
+mod row;
+mod filter;
+mod project;
 mod io_setup;
 
 fn db_main() -> Result<()> {
@@ -42,7 +45,13 @@ fn db_main() -> Result<()> {
     monitor_buf_reader.read_line(&mut input_line)?;
     let memory_limit_mb: u32 = input_line.trim().parse()?;
     eprintln!("Memory limit is set to {} MB", memory_limit_mb);
+    let block_size = disk::get_block_size(&mut disk_buf_reader, &mut disk_out)?;
 
+    let memory_limit_bytes = (memory_limit_mb as usize) * 1024 * 1024;
+    let buffer_pool_bytes = memory_limit_bytes * 3 / 4;
+    let capacity = std::cmp::max(1, buffer_pool_bytes / block_size);
+
+    let mut buffer_manager = BufferManager::new(block_size, capacity)?;
     // Execute query
     executor::execute_query(
         &ctx,
@@ -50,6 +59,7 @@ fn db_main() -> Result<()> {
         &mut disk_buf_reader,
         &mut disk_out,
         &mut monitor_out,
+        &mut buffer_manager,
     )?;
 
     Ok(())
