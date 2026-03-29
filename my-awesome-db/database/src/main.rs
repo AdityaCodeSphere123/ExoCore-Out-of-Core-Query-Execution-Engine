@@ -9,6 +9,7 @@ use crate::{
     io_setup::{setup_disk_io, setup_monitor_io},
 };
 use crate::buffer_manager::BufferManager;
+use crate::temp_storage::TempStorageManager;
 
 mod cli;
 mod disk;
@@ -18,7 +19,9 @@ mod buffer_manager;
 mod row;
 mod filter;
 mod project;
+mod sort;
 mod operator;
+mod temp_storage;
 mod io_setup;
 
 fn db_main() -> Result<()> {
@@ -49,11 +52,17 @@ fn db_main() -> Result<()> {
     let block_size = disk::get_block_size(&mut disk_buf_reader, &mut disk_out)?;
 
     let memory_limit_bytes = (memory_limit_mb as usize) * 1024 * 1024;
-    let buffer_pool_bytes = memory_limit_bytes * 3 / 4;
-    let capacity = std::cmp::max(1, buffer_pool_bytes / block_size);
 
+    // Keep the base-table read cache intentionally small. Sort needs the real
+    // working memory now, and scan/filter/project are already streaming.
+    let capacity = 2;
     let mut buffer_manager = BufferManager::new(block_size, capacity)?;
-    // Execute query
+
+    // Give ORDER BY most of the remaining budget for run generation.
+    let usable_for_sort = memory_limit_bytes.saturating_sub(capacity * block_size);
+    let sort_run_bytes = std::cmp::max(block_size, usable_for_sort / 2);
+    let mut temp_storage = TempStorageManager::new(block_size)?;
+
     executor::execute_query(
         &ctx,
         &query,
@@ -61,6 +70,8 @@ fn db_main() -> Result<()> {
         &mut disk_out,
         &mut monitor_out,
         &mut buffer_manager,
+        &mut temp_storage,
+        sort_run_bytes,
     )?;
 
     Ok(())

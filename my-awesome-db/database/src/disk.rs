@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 
 use crate::buffer::BlockBuffer;
 use crate::buffer_manager::BufferManager;
+use crate::operator::Operator;
 use crate::row::{Row, RowSchema};
 
 pub fn get_table_spec<'a>(ctx: &'a DbContext, table_id: &str) -> Result<&'a TableSpec> {
@@ -23,36 +24,6 @@ pub fn schema_from_table_spec(table_spec: &TableSpec) -> RowSchema {
             .map(|c| c.column_name.clone())
             .collect(),
     )
-}
-
-use crate::operator::{ExecContext, Operator};
-
-pub fn scan_table<RDisk, WDisk>(
-    ctx: &DbContext,
-    table_id: &str,
-    disk_reader: &mut RDisk,
-    disk_writer: &mut WDisk,
-    buffer_manager: &mut BufferManager,
-) -> Result<(RowSchema, Vec<Row>)>
-where
-    RDisk: BufRead,
-    WDisk: Write,
-{
-    let table_spec = get_table_spec(ctx, table_id)?;
-    let schema = schema_from_table_spec(table_spec);
-    let mut scanner = ScanOperator::new(table_id.to_string(), schema.clone());
-    let mut ctx = ExecContext {
-        db_ctx: ctx,
-        disk_reader,
-        disk_writer,
-        buffer_manager,
-    };
-
-    let mut rows = Vec::new();
-    while let Some(row) = scanner.next(&mut ctx)? {
-        rows.push(row);
-    }
-    Ok((schema, rows))
 }
 
 pub struct ScanOperator {
@@ -82,7 +53,7 @@ impl Operator for ScanOperator {
         &self.schema
     }
 
-    fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
+    fn next(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<Option<Row>> {
         loop {
             if let Some(rows) = &mut self.current_rows {
                 if let Some(row) = rows.next() {
@@ -91,11 +62,18 @@ impl Operator for ScanOperator {
                 self.current_rows = None;
             }
 
-            // Need to load next block
             if self.start_block.is_none() {
                 let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
-                self.start_block = Some(get_file_start_block(ctx.disk_reader, ctx.disk_writer, &table_spec.file_id)?);
-                self.num_blocks = Some(get_file_num_blocks(ctx.disk_reader, ctx.disk_writer, &table_spec.file_id)?);
+                self.start_block = Some(get_file_start_block(
+                    ctx.disk_reader,
+                    ctx.disk_writer,
+                    &table_spec.file_id,
+                )?);
+                self.num_blocks = Some(get_file_num_blocks(
+                    ctx.disk_reader,
+                    ctx.disk_writer,
+                    &table_spec.file_id,
+                )?);
             }
 
             let start_block = self.start_block.unwrap();
@@ -106,10 +84,12 @@ impl Operator for ScanOperator {
             }
 
             let block_id = start_block + self.current_block_offset;
-            let block = ctx.buffer_manager.get_block(block_id, ctx.disk_reader, ctx.disk_writer)?;
+            let block = ctx
+                .buffer_manager
+                .get_block(block_id, ctx.disk_reader, ctx.disk_writer)?;
             let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
             let block_rows = decode_block_into_rows(table_spec, block)?;
-            
+
             self.current_rows = Some(block_rows.into_iter());
             self.current_block_offset += 1;
         }

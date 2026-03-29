@@ -1,15 +1,19 @@
 use anyhow::Result;
+
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 
-pub struct ProjectOperator {
-    underlying: Box<dyn Operator>,
+pub struct ProjectOperator<'a> {
+    underlying: Box<dyn Operator + 'a>,
     indices: Vec<usize>,
     schema: RowSchema,
 }
 
-impl ProjectOperator {
-    pub fn new(underlying: Box<dyn Operator>, column_name_map: &Vec<(String, String)>) -> Result<Self> {
+impl<'a> ProjectOperator<'a> {
+    pub fn new(
+        underlying: Box<dyn Operator + 'a>,
+        column_name_map: &[(String, String)],
+    ) -> Result<Self> {
         let input_schema = underlying.schema();
         let mut indices = Vec::with_capacity(column_name_map.len());
         let mut output_columns = Vec::with_capacity(column_name_map.len());
@@ -28,7 +32,7 @@ impl ProjectOperator {
     }
 }
 
-impl Operator for ProjectOperator {
+impl<'a> Operator for ProjectOperator<'a> {
     fn schema(&self) -> &RowSchema {
         &self.schema
     }

@@ -145,8 +145,22 @@ pub fn data_to_string(data: &Data) -> String {
     match data {
         Data::Int32(v) => v.to_string(),
         Data::Int64(v) => v.to_string(),
-        Data::Float32(v) => v.to_string(),
-        Data::Float64(v) => v.to_string(),
+        Data::Float32(v) => {
+            let s = v.to_string();
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{s}.0")
+            }
+        }
+        Data::Float64(v) => {
+            let s = v.to_string();
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{s}.0")
+            }
+        }
         Data::String(v) => v.clone(),
     }
 }

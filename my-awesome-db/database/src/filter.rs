@@ -1,17 +1,17 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
 
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 
-pub struct FilterOperator {
-    underlying: Box<dyn Operator>,
-    predicates: Vec<Predicate>,
+pub struct FilterOperator<'a> {
+    underlying: Box<dyn Operator + 'a>,
+    predicates: &'a [Predicate],
 }
 
-impl FilterOperator {
-    pub fn new(underlying: Box<dyn Operator>, predicates: Vec<Predicate>) -> Self {
+impl<'a> FilterOperator<'a> {
+    pub fn new(underlying: Box<dyn Operator + 'a>, predicates: &'a [Predicate]) -> Self {
         Self {
             underlying,
             predicates,
@@ -19,7 +19,7 @@ impl FilterOperator {
     }
 }
 
-impl Operator for FilterOperator {
+impl<'a> Operator for FilterOperator<'a> {
     fn schema(&self) -> &RowSchema {
         self.underlying.schema()
     }
@@ -27,7 +27,7 @@ impl Operator for FilterOperator {
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
         while let Some(row) = self.underlying.next(ctx)? {
             let mut keep = true;
-            for pred in &self.predicates {
+            for pred in self.predicates {
                 if !evaluate_predicate(self.schema(), &row, pred)? {
                     keep = false;
                     break;
@@ -41,22 +41,13 @@ impl Operator for FilterOperator {
     }
 }
 
-fn evaluate_predicate(
-    schema: &RowSchema,
-    row: &Row,
-    pred: &Predicate,
-) -> Result<bool> {
+fn evaluate_predicate(schema: &RowSchema, row: &Row, pred: &Predicate) -> Result<bool> {
     let left = row.get_by_name(schema, &pred.column_name)?;
     let right = resolve_rhs(schema, row, &pred.value)?;
-
     compare_data(left, &pred.operator, &right)
 }
 
-fn resolve_rhs(
-    schema: &RowSchema,
-    row: &Row,
-    value: &ComparisionValue,
-) -> Result<Data> {
+fn resolve_rhs(schema: &RowSchema, row: &Row, value: &ComparisionValue) -> Result<Data> {
     match value {
         ComparisionValue::Column(col_name) => Ok(row.get_by_name(schema, col_name)?.clone()),
         ComparisionValue::I32(v) => Ok(Data::Int32(*v)),
