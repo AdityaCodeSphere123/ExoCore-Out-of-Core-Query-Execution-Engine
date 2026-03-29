@@ -18,6 +18,7 @@ mod buffer;
 mod buffer_manager;
 mod row;
 mod filter;
+mod join;
 mod project;
 mod sort;
 mod operator;
@@ -58,7 +59,6 @@ fn db_main() -> Result<()> {
     let capacity = 2;
     let mut buffer_manager = BufferManager::new(block_size, capacity)?;
 
-    // Give ORDER BY most of the remaining budget for run generation.
     let usable_for_sort = memory_limit_bytes.saturating_sub(capacity * block_size);
     let sort_run_bytes = std::cmp::max(block_size, usable_for_sort / 2);
     let mut temp_storage = TempStorageManager::new(block_size)?;

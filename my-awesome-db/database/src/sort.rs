@@ -122,15 +122,11 @@ impl<'a> Operator for SortOperator<'a> {
 }
 
 fn spill_run(ctx: &mut ExecContext, rows: &[Row]) -> Result<TempFileId> {
-    let disk_reader = &mut *ctx.disk_reader;
-    let disk_writer = &mut *ctx.disk_writer;
-    let temp_storage = &mut *ctx.temp_storage;
-
-    let mut writer = TempRunWriter::new(temp_storage)?;
+    let mut writer = TempRunWriter::new(ctx.temp_storage)?;
     for row in rows {
-        writer.append_row(row, disk_reader, disk_writer)?;
+        writer.append_row(row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
     }
-    writer.finish(disk_reader, disk_writer)
+    writer.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)
 }
 
 fn sort_rows(rows: &mut [Row], sort_keys: &[SortKey]) {

@@ -130,7 +130,7 @@ fn validate(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Re
         }
 
         if expected_output_line.trim() != db_in_line.trim() {
-            eprintln!("mismatch");
+            eprintln!("mismatch {},{}",expected_output_line,db_in_line);
             bail!(
                 "Expected line output\n{}\nbut database returned\n{}\nerror at line {line_count}",
                 expected_output_line,

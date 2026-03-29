@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use crate::buffer_manager::BufferManager;
 use crate::disk;
 use crate::filter;
+use crate::join;
 use crate::operator::{ExecContext, Operator};
 use crate::project;
 use crate::sort;
@@ -58,11 +59,25 @@ fn execute_op_tree<'a>(ctx: &DbContext, op: &'a QueryOp) -> Result<Box<dyn Opera
         }
 
         QueryOp::Filter(filter_data) => {
+            // When a Filter sits directly on top of a Cross, treat the whole
+            // thing as a join: extract equi-join predicates for Grace Hash
+            // Join and push any remaining predicates down as post-join filters.
+            if let QueryOp::Cross(cross_data) = filter_data.underlying.as_ref() {
+                let left = execute_op_tree(ctx, &cross_data.left)?;
+                let right = execute_op_tree(ctx, &cross_data.right)?;
+                return join::build_join(left, right, &filter_data.predicates);
+            }
             let underlying = execute_op_tree(ctx, &filter_data.underlying)?;
             Ok(Box::new(filter::FilterOperator::new(
                 underlying,
                 &filter_data.predicates,
             )))
+        }
+
+        QueryOp::Cross(cross_data) => {
+            let left = execute_op_tree(ctx, &cross_data.left)?;
+            let right = execute_op_tree(ctx, &cross_data.right)?;
+            join::build_join(left, right, &[])
         }
 
         QueryOp::Project(project_data) => {

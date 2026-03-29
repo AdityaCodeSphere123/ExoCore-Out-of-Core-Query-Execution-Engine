@@ -179,8 +179,13 @@ impl TempStorageManager {
     }
 }
 
-pub struct TempRunWriter<'a> {
-    storage: &'a mut TempStorageManager,
+/// A writer for a single sorted run in temp storage.
+///
+/// Unlike `TempRunReader`, this struct does NOT borrow `TempStorageManager`.
+/// Instead, `storage` is passed as a parameter to each method.  This lets
+/// multiple `TempRunWriter`s coexist (needed during Grace Hash Join
+/// partitioning where we maintain one writer per partition simultaneously).
+pub struct TempRunWriter {
     file_id: TempFileId,
     page_buf: Vec<u8>,
     page_offset: usize,
@@ -188,12 +193,11 @@ pub struct TempRunWriter<'a> {
     finished: bool,
 }
 
-impl<'a> TempRunWriter<'a> {
-    pub fn new(storage: &'a mut TempStorageManager) -> Result<Self> {
+impl TempRunWriter {
+    pub fn new(storage: &mut TempStorageManager) -> Result<Self> {
         let file_id = storage.create_temp_file()?;
         let page_buf = vec![0u8; storage.block_size()];
         Ok(Self {
-            storage,
             file_id,
             page_buf,
             page_offset: 0,
@@ -209,6 +213,7 @@ impl<'a> TempRunWriter<'a> {
     pub fn append_row<RDisk, WDisk>(
         &mut self,
         row: &Row,
+        storage: &mut TempStorageManager,
         disk_reader: &mut RDisk,
         disk_writer: &mut WDisk,
     ) -> Result<()>
@@ -233,7 +238,7 @@ impl<'a> TempRunWriter<'a> {
         }
 
         if self.page_offset + record_len > usable_end {
-            self.flush_current_page(disk_reader, disk_writer)?;
+            self.flush_current_page(storage, disk_reader, disk_writer)?;
         }
 
         let len_bytes = (encoded.len() as u32).to_le_bytes();
@@ -248,6 +253,7 @@ impl<'a> TempRunWriter<'a> {
 
     pub fn finish<RDisk, WDisk>(
         mut self,
+        storage: &mut TempStorageManager,
         disk_reader: &mut RDisk,
         disk_writer: &mut WDisk,
     ) -> Result<TempFileId>
@@ -256,8 +262,8 @@ impl<'a> TempRunWriter<'a> {
         WDisk: Write + ?Sized,
     {
         if !self.finished {
-            if self.row_count > 0 || self.storage.num_pages(self.file_id)? == 0 {
-                self.flush_current_page(disk_reader, disk_writer)?;
+            if self.row_count > 0 || storage.num_pages(self.file_id)? == 0 {
+                self.flush_current_page(storage, disk_reader, disk_writer)?;
             }
             self.finished = true;
         }
@@ -266,6 +272,7 @@ impl<'a> TempRunWriter<'a> {
 
     fn flush_current_page<RDisk, WDisk>(
         &mut self,
+        storage: &mut TempStorageManager,
         disk_reader: &mut RDisk,
         disk_writer: &mut WDisk,
     ) -> Result<()>
@@ -277,11 +284,8 @@ impl<'a> TempRunWriter<'a> {
         self.page_buf[usable_end..usable_end + 2]
             .copy_from_slice(&self.row_count.to_le_bytes());
 
-        let page_id = self
-            .storage
-            .allocate_page(self.file_id, disk_reader, disk_writer)?;
-        self.storage
-            .write_page(page_id, &self.page_buf, disk_reader, disk_writer)?;
+        let page_id = storage.allocate_page(self.file_id, disk_reader, disk_writer)?;
+        storage.write_page(page_id, &self.page_buf, disk_reader, disk_writer)?;
 
         self.page_buf.fill(0);
         self.page_offset = 0;
