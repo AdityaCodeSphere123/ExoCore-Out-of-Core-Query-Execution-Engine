@@ -2,31 +2,43 @@ use anyhow::{anyhow, bail, Result};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
 
+use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 
-pub fn apply_filter(
-    schema: &RowSchema,
-    input_rows: Vec<Row>,
-    predicates: &Vec<Predicate>,
-) -> Result<(RowSchema, Vec<Row>)> {
-    let mut output_rows = Vec::new();
+pub struct FilterOperator {
+    underlying: Box<dyn Operator>,
+    predicates: Vec<Predicate>,
+}
 
-    for row in input_rows {
-        let mut keep = true;
-
-        for pred in predicates {
-            if !evaluate_predicate(schema, &row, pred)? {
-                keep = false;
-                break;
-            }
-        }
-
-        if keep {
-            output_rows.push(row);
+impl FilterOperator {
+    pub fn new(underlying: Box<dyn Operator>, predicates: Vec<Predicate>) -> Self {
+        Self {
+            underlying,
+            predicates,
         }
     }
+}
 
-    Ok((schema.clone(), output_rows))
+impl Operator for FilterOperator {
+    fn schema(&self) -> &RowSchema {
+        self.underlying.schema()
+    }
+
+    fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
+        while let Some(row) = self.underlying.next(ctx)? {
+            let mut keep = true;
+            for pred in &self.predicates {
+                if !evaluate_predicate(self.schema(), &row, pred)? {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn evaluate_predicate(

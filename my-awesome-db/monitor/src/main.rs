@@ -74,11 +74,17 @@ fn setup_db_process(
             };
 
             if setrlimit(libc::RLIMIT_AS, &rlimit) != 0 {
+                #[cfg(not(target_os = "macos"))]
                 panic!("Unable to set memory limit");
+                #[cfg(target_os = "macos")]
+                eprintln!("Warning: Unable to set memory limit (RLIMIT_AS) on macOS.");
             }
 
             if setrlimit(libc::RLIMIT_STACK, &rlimit) != 0 {
+                #[cfg(not(target_os = "macos"))]
                 panic!("Unable to set stack limit");
+                #[cfg(target_os = "macos")]
+                eprintln!("Warning: Unable to set stack limit (RLIMIT_STACK) on macOS.");
             }
 
             rlimit.rlim_cur = 0;

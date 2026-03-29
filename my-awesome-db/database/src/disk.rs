@@ -25,6 +25,8 @@ pub fn schema_from_table_spec(table_spec: &TableSpec) -> RowSchema {
     )
 }
 
+use crate::operator::{ExecContext, Operator};
+
 pub fn scan_table<RDisk, WDisk>(
     ctx: &DbContext,
     table_id: &str,
@@ -38,29 +40,80 @@ where
 {
     let table_spec = get_table_spec(ctx, table_id)?;
     let schema = schema_from_table_spec(table_spec);
-
-    let start_block = get_file_start_block(disk_reader, disk_writer, &table_spec.file_id)?;
-    let num_blocks = get_file_num_blocks(disk_reader, disk_writer, &table_spec.file_id)?;
-
-    eprintln!(
-        "scan table={} file={} start_block={} num_blocks={} block_size={}",
-        table_spec.name,
-        table_spec.file_id,
-        start_block,
-        num_blocks,
-        buffer_manager.block_size()
-    );
+    let mut scanner = ScanOperator::new(table_id.to_string(), schema.clone());
+    let mut ctx = ExecContext {
+        db_ctx: ctx,
+        disk_reader,
+        disk_writer,
+        buffer_manager,
+    };
 
     let mut rows = Vec::new();
+    while let Some(row) = scanner.next(&mut ctx)? {
+        rows.push(row);
+    }
+    Ok((schema, rows))
+}
 
-    for block_offset in 0..num_blocks {
-        let block_id = start_block + block_offset;
-        let block = buffer_manager.get_block(block_id, disk_reader, disk_writer)?;
-        let mut block_rows = decode_block_into_rows(table_spec, block)?;
-        rows.append(&mut block_rows);
+pub struct ScanOperator {
+    table_id: String,
+    schema: RowSchema,
+    start_block: Option<u64>,
+    num_blocks: Option<u64>,
+    current_block_offset: u64,
+    current_rows: Option<std::vec::IntoIter<Row>>,
+}
+
+impl ScanOperator {
+    pub fn new(table_id: String, schema: RowSchema) -> Self {
+        Self {
+            table_id,
+            schema,
+            start_block: None,
+            num_blocks: None,
+            current_block_offset: 0,
+            current_rows: None,
+        }
+    }
+}
+
+impl Operator for ScanOperator {
+    fn schema(&self) -> &RowSchema {
+        &self.schema
     }
 
-    Ok((schema, rows))
+    fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
+        loop {
+            if let Some(rows) = &mut self.current_rows {
+                if let Some(row) = rows.next() {
+                    return Ok(Some(row));
+                }
+                self.current_rows = None;
+            }
+
+            // Need to load next block
+            if self.start_block.is_none() {
+                let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
+                self.start_block = Some(get_file_start_block(ctx.disk_reader, ctx.disk_writer, &table_spec.file_id)?);
+                self.num_blocks = Some(get_file_num_blocks(ctx.disk_reader, ctx.disk_writer, &table_spec.file_id)?);
+            }
+
+            let start_block = self.start_block.unwrap();
+            let num_blocks = self.num_blocks.unwrap();
+
+            if self.current_block_offset >= num_blocks {
+                return Ok(None);
+            }
+
+            let block_id = start_block + self.current_block_offset;
+            let block = ctx.buffer_manager.get_block(block_id, ctx.disk_reader, ctx.disk_writer)?;
+            let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
+            let block_rows = decode_block_into_rows(table_spec, block)?;
+            
+            self.current_rows = Some(block_rows.into_iter());
+            self.current_block_offset += 1;
+        }
+    }
 }
 
 pub fn get_block_size<RDisk, WDisk>(
@@ -68,8 +121,8 @@ pub fn get_block_size<RDisk, WDisk>(
     disk_writer: &mut WDisk,
 ) -> Result<usize>
 where
-    RDisk: BufRead,
-    WDisk: Write,
+    RDisk: BufRead + ?Sized,
+    WDisk: Write + ?Sized,
 {
     disk_writer.write_all(b"get block-size\n")?;
     disk_writer.flush()?;
@@ -85,8 +138,8 @@ pub fn get_file_start_block<RDisk, WDisk>(
     file_id: &str,
 ) -> Result<u64>
 where
-    RDisk: BufRead,
-    WDisk: Write,
+    RDisk: BufRead + ?Sized,
+    WDisk: Write + ?Sized,
 {
     let cmd = format!("get file start-block {}\n", file_id);
     disk_writer.write_all(cmd.as_bytes())?;
@@ -103,8 +156,8 @@ pub fn get_file_num_blocks<RDisk, WDisk>(
     file_id: &str,
 ) -> Result<u64>
 where
-    RDisk: BufRead,
-    WDisk: Write,
+    RDisk: BufRead + ?Sized,
+    WDisk: Write + ?Sized,
 {
     let cmd = format!("get file num-blocks {}\n", file_id);
     disk_writer.write_all(cmd.as_bytes())?;

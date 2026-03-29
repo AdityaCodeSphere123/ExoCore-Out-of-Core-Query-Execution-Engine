@@ -7,9 +7,7 @@ use crate::buffer_manager::BufferManager;
 use crate::disk;
 use crate::filter;
 use crate::project;
-use crate::row::{Row, RowSchema};
-
-type ExecResultSet = (RowSchema, Vec<Row>);
+use crate::operator::{ExecContext, Operator};
 
 pub fn execute_query<RDisk, WDisk, WMon>(
     ctx: &DbContext,
@@ -24,16 +22,16 @@ where
     WDisk: Write,
     WMon: Write,
 {
-    let (_schema, rows) = execute_op(
-        ctx,
-        &query.root,
+    let mut operator = execute_op_tree(ctx, &query.root)?;
+    let mut exec_ctx = ExecContext {
+        db_ctx: ctx,
         disk_reader,
         disk_writer,
         buffer_manager,
-    )?;
+    };
 
     monitor_writer.write_all(b"validate\n")?;
-    for row in &rows {
+    while let Some(row) = operator.next(&mut exec_ctx)? {
         monitor_writer.write_all(row.to_pipe_string().as_bytes())?;
     }
     monitor_writer.write_all(b"!\n")?;
@@ -42,42 +40,25 @@ where
     Ok(())
 }
 
-fn execute_op<RDisk, WDisk>(
+fn execute_op_tree(
     ctx: &DbContext,
     op: &QueryOp,
-    disk_reader: &mut RDisk,
-    disk_writer: &mut WDisk,
-    buffer_manager: &mut BufferManager,
-) -> Result<ExecResultSet>
-where
-    RDisk: BufRead,
-    WDisk: Write,
-{
+) -> Result<Box<dyn Operator>> {
     match op {
         QueryOp::Scan(scan_data) => {
-            disk::scan_table(ctx, &scan_data.table_id, disk_reader, disk_writer, buffer_manager)
+            let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
+            let schema = disk::schema_from_table_spec(table_spec);
+            Ok(Box::new(disk::ScanOperator::new(scan_data.table_id.clone(), schema)))
         }
 
         QueryOp::Filter(filter_data) => {
-            let (schema, rows) = execute_op(
-                ctx,
-                &filter_data.underlying.as_ref(),
-                disk_reader,
-                disk_writer,
-                buffer_manager,
-            )?;
-            filter::apply_filter(&schema, rows, &filter_data.predicates)
+            let underlying = execute_op_tree(ctx, &filter_data.underlying)?;
+            Ok(Box::new(filter::FilterOperator::new(underlying, filter_data.predicates.clone())))
         }
 
         QueryOp::Project(project_data) => {
-            let (schema, rows) = execute_op(
-                ctx,
-                &project_data.underlying.as_ref(),
-                disk_reader,
-                disk_writer,
-                buffer_manager,
-            )?;
-            project::apply_project(&schema, rows, &project_data.column_name_map)
+            let underlying = execute_op_tree(ctx, &project_data.underlying)?;
+            Ok(Box::new(project::ProjectOperator::new(underlying, &project_data.column_name_map)?))
         }
 
         _ => bail!("operator not implemented yet"),

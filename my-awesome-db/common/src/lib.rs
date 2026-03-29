@@ -20,15 +20,29 @@ pub enum DataType {
     String,
 }
 
+impl Data {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Int32(v) => Some(*v as f64),
+            Self::Int64(v) => Some(*v as f64),
+            Self::Float32(v) => Some(*v as f64),
+            Self::Float64(v) => Some(*v),
+            Self::String(_) => None,
+        }
+    }
+}
+
 impl PartialOrd for Data {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Self::Int32(l0), Self::Int32(r0)) => l0.partial_cmp(r0),
-            (Self::Int64(l0), Self::Int64(r0)) => l0.partial_cmp(r0),
-            (Self::Float32(l0), Self::Float32(r0)) => l0.partial_cmp(r0),
-            (Self::Float64(l0), Self::Float64(r0)) => l0.partial_cmp(r0),
-            (Self::String(l0), Self::String(r0)) => l0.partial_cmp(r0),
-            _ => None,
+            (Self::String(l), Self::String(r)) => l.partial_cmp(r),
+            (l, r) => {
+                if let (Some(lf), Some(rf)) = (l.as_f64(), r.as_f64()) {
+                    lf.partial_cmp(&rf)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -36,12 +50,14 @@ impl PartialOrd for Data {
 impl PartialEq for Data {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Int32(l0), Self::Int32(r0)) => l0 == r0,
-            (Self::Int64(l0), Self::Int64(r0)) => l0 == r0,
-            (Self::Float32(l0), Self::Float32(r0)) => l0 == r0,
-            (Self::Float64(l0), Self::Float64(r0)) => l0 == r0,
-            (Self::String(l0), Self::String(r0)) => l0 == r0,
-            _ => false,
+            (Self::String(l), Self::String(r)) => l == r,
+            (l, r) => {
+                if let (Some(lf), Some(rf)) = (l.as_f64(), r.as_f64()) {
+                    lf == rf
+                } else {
+                    false
+                }
+            }
         }
     }
 }

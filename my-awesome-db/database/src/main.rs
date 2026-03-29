@@ -18,6 +18,7 @@ mod buffer_manager;
 mod row;
 mod filter;
 mod project;
+mod operator;
 mod io_setup;
 
 fn db_main() -> Result<()> {

@@ -53,8 +53,8 @@ impl BufferManager {
         disk_writer: &mut WDisk,
     ) -> Result<&[u8]>
     where
-        RDisk: BufRead,
-        WDisk: Write,
+        RDisk: BufRead + ?Sized,
+        WDisk: Write + ?Sized,
     {
         if let Some(&frame_idx) = self.page_table.get(&block_id) {
             let frame = self.frames[frame_idx]
@@ -111,8 +111,8 @@ fn fetch_block_from_disk<RDisk, WDisk>(
     disk_writer: &mut WDisk,
 ) -> Result<Vec<u8>>
 where
-    RDisk: BufRead,
-    WDisk: Write,
+    RDisk: BufRead + ?Sized,
+    WDisk: Write + ?Sized,
 {
     let cmd = format!("get block {} 1\n", block_id);
     disk_writer.write_all(cmd.as_bytes())?;
