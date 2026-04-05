@@ -1,6 +1,7 @@
-use anyhow::{bail, Result};
-use common::query::{Query, QueryOp};
+use anyhow::Result;
+use common::query::{ComparisionValue, Predicate, Query, QueryOp, SortSpec};
 use db_config::DbContext;
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 
 use crate::buffer_manager::BufferManager;
@@ -27,7 +28,7 @@ where
     WDisk: Write,
     WMon: Write,
 {
-    let mut operator = execute_op_tree(ctx, &query.root)?;
+    let mut operator = execute_op_tree(ctx, &query.root, None)?;
     let mut exec_ctx = ExecContext {
         db_ctx: ctx,
         disk_reader,
@@ -47,41 +48,80 @@ where
     Ok(())
 }
 
-fn execute_op_tree<'a>(ctx: &DbContext, op: &'a QueryOp) -> Result<Box<dyn Operator + 'a>> {
+/// Build the operator tree, propagating `needed_above` (the set of column names
+/// required by ancestors) downward so that scans can be wrapped in an early
+/// projection that trims unused columns.
+///
+/// `needed_above = None` means "all columns are needed" (no pruning).
+/// A `Project` node acts as a barrier: it replaces the needed set with exactly
+/// the source columns it maps from.
+fn execute_op_tree<'a>(
+    ctx: &DbContext,
+    op: &'a QueryOp,
+    needed_above: Option<&HashSet<String>>,
+) -> Result<Box<dyn Operator + 'a>> {
     match op {
         QueryOp::Scan(scan_data) => {
             let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
-            let schema = disk::schema_from_table_spec(table_spec);
-            Ok(Box::new(disk::ScanOperator::new(
+            let full_schema = disk::schema_from_table_spec(table_spec);
+            let scan = Box::new(disk::ScanOperator::new(
                 scan_data.table_id.clone(),
-                schema,
-            )))
+                full_schema.clone(),
+            ));
+
+            // If we know which columns are needed, trim the rest.
+            if let Some(needed) = needed_above {
+                let keep: Vec<(String, String)> = full_schema
+                    .column_names()
+                    .iter()
+                    .filter(|c| needed.contains(c.as_str()))
+                    .map(|c| (c.clone(), c.clone()))
+                    .collect();
+
+                if !keep.is_empty() && keep.len() < full_schema.len() {
+                    return Ok(Box::new(project::ProjectOperator::new(scan, &keep)?));
+                }
+            }
+
+            Ok(scan)
         }
 
         QueryOp::Filter(filter_data) => {
             // When a Filter sits directly on top of a Cross, treat the whole
-            // thing as a join: extract equi-join predicates for Grace Hash
-            // Join and push any remaining predicates down as post-join filters.
+            // thing as a join.
             if let QueryOp::Cross(cross_data) = filter_data.underlying.as_ref() {
-                let left = execute_op_tree(ctx, &cross_data.left)?;
-                let right = execute_op_tree(ctx, &cross_data.right)?;
+                let child_needed =
+                    add_predicate_columns(needed_above, &filter_data.predicates);
+                let left =
+                    execute_op_tree(ctx, &cross_data.left, child_needed.as_ref())?;
+                let right =
+                    execute_op_tree(ctx, &cross_data.right, child_needed.as_ref())?;
                 return join::build_join(left, right, &filter_data.predicates);
             }
-            let underlying = execute_op_tree(ctx, &filter_data.underlying)?;
+            let child_needed =
+                add_predicate_columns(needed_above, &filter_data.predicates);
+            let underlying =
+                execute_op_tree(ctx, &filter_data.underlying, child_needed.as_ref())?;
             Ok(Box::new(filter::FilterOperator::new(
                 underlying,
                 &filter_data.predicates,
-            )))
+            )?))
         }
 
         QueryOp::Cross(cross_data) => {
-            let left = execute_op_tree(ctx, &cross_data.left)?;
-            let right = execute_op_tree(ctx, &cross_data.right)?;
+            let left = execute_op_tree(ctx, &cross_data.left, needed_above)?;
+            let right = execute_op_tree(ctx, &cross_data.right, needed_above)?;
             join::build_join(left, right, &[])
         }
 
         QueryOp::Project(project_data) => {
-            let underlying = execute_op_tree(ctx, &project_data.underlying)?;
+            // Project is a barrier: only source columns are needed from child.
+            let mut child_needed = HashSet::new();
+            for (source, _alias) in &project_data.column_name_map {
+                child_needed.insert(source.clone());
+            }
+            let underlying =
+                execute_op_tree(ctx, &project_data.underlying, Some(&child_needed))?;
             Ok(Box::new(project::ProjectOperator::new(
                 underlying,
                 &project_data.column_name_map,
@@ -89,13 +129,47 @@ fn execute_op_tree<'a>(ctx: &DbContext, op: &'a QueryOp) -> Result<Box<dyn Opera
         }
 
         QueryOp::Sort(sort_data) => {
-            let underlying = execute_op_tree(ctx, &sort_data.underlying)?;
+            let child_needed =
+                add_sort_columns(needed_above, &sort_data.sort_specs);
+            let underlying =
+                execute_op_tree(ctx, &sort_data.underlying, child_needed.as_ref())?;
             Ok(Box::new(sort::SortOperator::new(
                 underlying,
                 &sort_data.sort_specs,
             )?))
         }
 
-        _ => bail!("operator not implemented yet"),
     }
+}
+
+/// If `needed` is `Some`, extend it with columns referenced in the predicates.
+/// If `needed` is `None` (no pruning), return `None` (still no pruning).
+fn add_predicate_columns(
+    needed: Option<&HashSet<String>>,
+    predicates: &[Predicate],
+) -> Option<HashSet<String>> {
+    needed.map(|set| {
+        let mut result = set.clone();
+        for pred in predicates {
+            result.insert(pred.column_name.clone());
+            if let ComparisionValue::Column(c) = &pred.value {
+                result.insert(c.clone());
+            }
+        }
+        result
+    })
+}
+
+/// If `needed` is `Some`, extend it with sort-key columns.
+fn add_sort_columns(
+    needed: Option<&HashSet<String>>,
+    sort_specs: &[SortSpec],
+) -> Option<HashSet<String>> {
+    needed.map(|set| {
+        let mut result = set.clone();
+        for spec in sort_specs {
+            result.insert(spec.column_name.clone());
+        }
+        result
+    })
 }

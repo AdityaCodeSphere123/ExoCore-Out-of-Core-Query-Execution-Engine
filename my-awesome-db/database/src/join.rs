@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter};
@@ -41,50 +42,6 @@ fn partition_of(key: &JoinKey, n: usize) -> usize {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
     (h.finish() as usize) % n
-}
-
-// ── predicate evaluation on merged rows ──────────────────────────────────────
-
-fn eval_predicates(row: &Row, schema: &RowSchema, predicates: &[Predicate]) -> Result<bool> {
-    for pred in predicates {
-        let lv = row.get_by_name(schema, &pred.column_name)?;
-        let rv = match &pred.value {
-            ComparisionValue::Column(c) => row.get_by_name(schema, c)?.clone(),
-            ComparisionValue::I32(v) => Data::Int32(*v),
-            ComparisionValue::I64(v) => Data::Int64(*v),
-            ComparisionValue::F32(v) => Data::Float32(*v),
-            ComparisionValue::F64(v) => Data::Float64(*v),
-            ComparisionValue::String(v) => Data::String(v.clone()),
-        };
-        let ok = match &pred.operator {
-            ComparisionOperator::EQ => lv == &rv,
-            ComparisionOperator::NE => lv != &rv,
-            ComparisionOperator::LT => {
-                lv.partial_cmp(&rv)
-                    .ok_or_else(|| anyhow!("incompatible types in join predicate"))?
-                    == std::cmp::Ordering::Less
-            }
-            ComparisionOperator::LTE => matches!(
-                lv.partial_cmp(&rv)
-                    .ok_or_else(|| anyhow!("incompatible types in join predicate"))?,
-                std::cmp::Ordering::Less | std::cmp::Ordering::Equal
-            ),
-            ComparisionOperator::GT => {
-                lv.partial_cmp(&rv)
-                    .ok_or_else(|| anyhow!("incompatible types in join predicate"))?
-                    == std::cmp::Ordering::Greater
-            }
-            ComparisionOperator::GTE => matches!(
-                lv.partial_cmp(&rv)
-                    .ok_or_else(|| anyhow!("incompatible types in join predicate"))?,
-                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
-            ),
-        };
-        if !ok {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -136,13 +93,13 @@ pub fn build_join<'a>(
             left_key_indices,
             right_key_indices,
             extra_predicates,
-        )))
+        )?))
     } else {
         Ok(Box::new(CrossJoinOperator::new(
             left,
             right,
             extra_predicates,
-        )))
+        )?))
     }
 }
 
@@ -153,7 +110,7 @@ pub struct HashJoinOperator<'a> {
     right: Option<Box<dyn Operator + 'a>>,
     left_key_indices: Vec<usize>,
     right_key_indices: Vec<usize>,
-    extra_predicates: Vec<Predicate>,
+    resolved_extra: Vec<ResolvedPredicate>,
     left_schema: RowSchema,
     merged_schema: RowSchema,
     state: HashJoinState,
@@ -184,20 +141,21 @@ impl<'a> HashJoinOperator<'a> {
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
         extra_predicates: Vec<Predicate>,
-    ) -> Self {
+    ) -> Result<Self> {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
         let merged_schema = RowSchema::merge(&left_schema, &right_schema);
-        Self {
+        let resolved_extra = resolve_predicates(&merged_schema, &extra_predicates)?;
+        Ok(Self {
             left: Some(left),
             right: Some(right),
             left_key_indices,
             right_key_indices,
-            extra_predicates,
+            resolved_extra,
             left_schema,
             merged_schema,
             state: HashJoinState::NotStarted,
-        }
+        })
     }
 
     /// Partition both inputs into `num_partitions` temp files.
@@ -211,11 +169,15 @@ impl<'a> HashJoinOperator<'a> {
         // (left + right), so cap at sort_run_bytes / (2 × block_size).
         let num_partitions = (ctx.sort_run_bytes / (2 * block_size)).clamp(4, 256);
 
+        // Use a small batch size for partition writers to keep memory bounded
+        // when many partitions are active simultaneously (up to 2 × num_partitions
+        // writers).  Readers created during the probe phase use the larger default.
+        const JOIN_WRITER_BATCH: usize = 4;
         let mut left_writers: Vec<TempRunWriter> = (0..num_partitions)
-            .map(|_| TempRunWriter::new(ctx.temp_storage))
+            .map(|_| TempRunWriter::with_batch_pages(ctx.temp_storage, JOIN_WRITER_BATCH))
             .collect::<Result<_>>()?;
         let mut right_writers: Vec<TempRunWriter> = (0..num_partitions)
-            .map(|_| TempRunWriter::new(ctx.temp_storage))
+            .map(|_| TempRunWriter::with_batch_pages(ctx.temp_storage, JOIN_WRITER_BATCH))
             .collect::<Result<_>>()?;
 
         // Partition left.
@@ -356,10 +318,9 @@ impl<'a> Operator for HashJoinOperator<'a> {
                             if let Some(left_rows) = ps.build_map.get(&key) {
                                 for left_row in left_rows {
                                     let merged = Row::merge(left_row, &right_row);
-                                    if eval_predicates(
+                                    if eval_resolved(
                                         &merged,
-                                        &self.merged_schema,
-                                        &self.extra_predicates,
+                                        &self.resolved_extra,
                                     )? {
                                         ps.output_buf.push(merged);
                                     }
@@ -387,7 +348,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
 pub struct CrossJoinOperator<'a> {
     left: Option<Box<dyn Operator + 'a>>,
     right: Option<Box<dyn Operator + 'a>>,
-    predicates: Vec<Predicate>,
+    resolved: Vec<ResolvedPredicate>,
     merged_schema: RowSchema,
     state: CrossState,
 }
@@ -412,17 +373,18 @@ impl<'a> CrossJoinOperator<'a> {
         left: Box<dyn Operator + 'a>,
         right: Box<dyn Operator + 'a>,
         predicates: Vec<Predicate>,
-    ) -> Self {
+    ) -> Result<Self> {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
         let merged_schema = RowSchema::merge(&left_schema, &right_schema);
-        Self {
+        let resolved = resolve_predicates(&merged_schema, &predicates)?;
+        Ok(Self {
             left: Some(left),
             right: Some(right),
-            predicates,
+            resolved,
             merged_schema,
             state: CrossState::NotStarted,
-        }
+        })
     }
 
     fn spill_left(&mut self, ctx: &mut ExecContext) -> Result<TempFileId> {
@@ -503,7 +465,7 @@ impl<'a> Operator for CrossJoinOperator<'a> {
                                 right_row,
                                 left_reader,
                             };
-                            if eval_predicates(&merged, &self.merged_schema, &self.predicates)? {
+                            if eval_resolved(&merged, &self.resolved)? {
                                 return Ok(Some(merged));
                             }
                         }

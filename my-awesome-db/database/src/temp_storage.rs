@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 
 use crate::row::Row;
 
-const DEFAULT_TEMP_IO_BATCH_PAGES: usize = 4;
+const DEFAULT_TEMP_IO_BATCH_PAGES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TempFileId(pub u64);
