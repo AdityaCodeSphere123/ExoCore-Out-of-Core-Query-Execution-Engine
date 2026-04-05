@@ -44,6 +44,21 @@ fn partition_of(key: &JoinKey, n: usize) -> usize {
     (h.finish() as usize) % n
 }
 
+// Keep hash-join partitioning conservative. The old code scaled up to 256
+// partitions from sort_run_bytes, which caused lots of live writers and empty
+// or one-sided temp files. This keeps memory bounded while still spreading
+// data enough for probing.
+const MIN_HASH_JOIN_PARTITIONS: usize = 8;
+const MAX_HASH_JOIN_PARTITIONS: usize = 32;
+const TARGET_PARTITION_PAGES: usize = 256;
+const JOIN_WRITER_BATCH: usize = 4;
+
+fn choose_num_partitions(ctx: &ExecContext) -> usize {
+    let block_size = ctx.temp_storage.block_size();
+    let target_bytes = TARGET_PARTITION_PAGES.saturating_mul(block_size).max(1);
+    (ctx.sort_run_bytes / target_bytes).clamp(MIN_HASH_JOIN_PARTITIONS, MAX_HASH_JOIN_PARTITIONS)
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 
 /// Inspect predicates and build a Grace Hash Join when there is at least one
@@ -158,27 +173,21 @@ impl<'a> HashJoinOperator<'a> {
         })
     }
 
-    /// Partition both inputs into `num_partitions` temp files.
-    /// All rows with the same join key hash go to the same partition.
+    /// Partition both inputs into temp files, but create writers lazily so we
+    /// never pay memory or temp-file overhead for untouched partitions.
+    ///
+    /// We also only keep partitions where both sides are non-empty. One-sided
+    /// partitions can never produce output, so we discard them before probing.
     fn partition_inputs(
         &mut self,
         ctx: &mut ExecContext,
     ) -> Result<(Vec<TempFileId>, Vec<TempFileId>)> {
-        let block_size = ctx.temp_storage.block_size();
-        // Each writer owns one block-sized page buffer. We allocate 2×N writers
-        // (left + right), so cap at sort_run_bytes / (2 × block_size).
-        let num_partitions = (ctx.sort_run_bytes / (2 * block_size)).clamp(4, 256);
+        let num_partitions = choose_num_partitions(ctx);
 
-        // Use a small batch size for partition writers to keep memory bounded
-        // when many partitions are active simultaneously (up to 2 × num_partitions
-        // writers).  Readers created during the probe phase use the larger default.
-        const JOIN_WRITER_BATCH: usize = 4;
-        let mut left_writers: Vec<TempRunWriter> = (0..num_partitions)
-            .map(|_| TempRunWriter::with_batch_pages(ctx.temp_storage, JOIN_WRITER_BATCH))
-            .collect::<Result<_>>()?;
-        let mut right_writers: Vec<TempRunWriter> = (0..num_partitions)
-            .map(|_| TempRunWriter::with_batch_pages(ctx.temp_storage, JOIN_WRITER_BATCH))
-            .collect::<Result<_>>()?;
+        let mut left_writers: Vec<Option<TempRunWriter>> =
+            (0..num_partitions).map(|_| None).collect();
+        let mut right_writers: Vec<Option<TempRunWriter>> =
+            (0..num_partitions).map(|_| None).collect();
 
         // Partition left.
         let mut left = self.left.take().expect("left already consumed");
@@ -190,12 +199,21 @@ impl<'a> HashJoinOperator<'a> {
             };
             let key = make_key(&row, &self.left_key_indices);
             let part = partition_of(&key, num_partitions);
-            left_writers[part].append_row(
-                &row,
-                ctx.temp_storage,
-                &mut *ctx.disk_reader,
-                &mut *ctx.disk_writer,
-            )?;
+            if left_writers[part].is_none() {
+                left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                    ctx.temp_storage,
+                    JOIN_WRITER_BATCH,
+                )?);
+            }
+            left_writers[part]
+                .as_mut()
+                .expect("left partition writer should exist")
+                .append_row(
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
+                )?;
         }
         drop(left);
 
@@ -209,24 +227,58 @@ impl<'a> HashJoinOperator<'a> {
             };
             let key = make_key(&row, &self.right_key_indices);
             let part = partition_of(&key, num_partitions);
-            right_writers[part].append_row(
-                &row,
-                ctx.temp_storage,
-                &mut *ctx.disk_reader,
-                &mut *ctx.disk_writer,
-            )?;
+            if right_writers[part].is_none() {
+                right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                    ctx.temp_storage,
+                    JOIN_WRITER_BATCH,
+                )?);
+            }
+            right_writers[part]
+                .as_mut()
+                .expect("right partition writer should exist")
+                .append_row(
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
+                )?;
         }
         drop(right);
 
-        // Flush and seal all partition files.
-        let left_parts: Vec<TempFileId> = left_writers
-            .into_iter()
-            .map(|w| w.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer))
-            .collect::<Result<_>>()?;
-        let right_parts: Vec<TempFileId> = right_writers
-            .into_iter()
-            .map(|w| w.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer))
-            .collect::<Result<_>>()?;
+        let mut left_parts = Vec::new();
+        let mut right_parts = Vec::new();
+
+        for part in 0..num_partitions {
+            match (left_writers[part].take(), right_writers[part].take()) {
+                (Some(left_writer), Some(right_writer)) => {
+                    let left_file = left_writer.finish(
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                    let right_file = right_writer.finish(
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                    left_parts.push(left_file);
+                    right_parts.push(right_file);
+                }
+                (Some(left_writer), None) => {
+                    // This partition can never join. Drop any unwritten state and
+                    // remove its temp-file metadata so we never probe it later.
+                    let file_id = left_writer.file_id();
+                    drop(left_writer);
+                    ctx.temp_storage.delete_temp_file(file_id)?;
+                }
+                (None, Some(right_writer)) => {
+                    let file_id = right_writer.file_id();
+                    drop(right_writer);
+                    ctx.temp_storage.delete_temp_file(file_id)?;
+                }
+                (None, None) => {}
+            }
+        }
 
         Ok((left_parts, right_parts))
     }
@@ -291,8 +343,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
 
                         // Open streaming reader for right (probe) partition.
                         let right_file = ps.right_parts[ps.current_part];
-                        ps.probe_reader =
-                            Some(TempRunReader::new(ctx.temp_storage, right_file)?);
+                        ps.probe_reader = Some(TempRunReader::new(ctx.temp_storage, right_file)?);
                     }
 
                     // Fetch next probe row.
@@ -318,10 +369,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                             if let Some(left_rows) = ps.build_map.get(&key) {
                                 for left_row in left_rows {
                                     let merged = Row::merge(left_row, &right_row);
-                                    if eval_resolved(
-                                        &merged,
-                                        &self.resolved_extra,
-                                    )? {
+                                    if eval_resolved(&merged, &self.resolved_extra)? {
                                         ps.output_buf.push(merged);
                                     }
                                 }
@@ -431,8 +479,7 @@ impl<'a> Operator for CrossJoinOperator<'a> {
                             return Ok(None);
                         }
                         Some(right_row) => {
-                            let left_reader =
-                                TempRunReader::new(ctx.temp_storage, left_file)?;
+                            let left_reader = TempRunReader::new(ctx.temp_storage, left_file)?;
                             self.state = CrossState::Running {
                                 left_file,
                                 right_row,
