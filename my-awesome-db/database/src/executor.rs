@@ -64,26 +64,37 @@ fn execute_op_tree<'a>(
         QueryOp::Scan(scan_data) => {
             let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
             let full_schema = disk::schema_from_table_spec(table_spec);
-            let scan = Box::new(disk::ScanOperator::new(
-                scan_data.table_id.clone(),
-                full_schema.clone(),
-            ));
 
-            // If we know which columns are needed, trim the rest.
+            // Late materialization: push column pruning into the scan itself
+            // so unneeded columns are never decoded (skips string allocs, etc.).
             if let Some(needed) = needed_above {
-                let keep: Vec<(String, String)> = full_schema
+                let needed_indices: Vec<usize> = full_schema
                     .column_names()
                     .iter()
-                    .filter(|c| needed.contains(c.as_str()))
-                    .map(|c| (c.clone(), c.clone()))
+                    .enumerate()
+                    .filter(|(_, c)| needed.contains(c.as_str()))
+                    .map(|(i, _)| i)
                     .collect();
 
-                if !keep.is_empty() && keep.len() < full_schema.len() {
-                    return Ok(Box::new(project::ProjectOperator::new(scan, &keep)?));
+                if !needed_indices.is_empty() && needed_indices.len() < full_schema.len() {
+                    let pruned_schema = crate::row::RowSchema::new(
+                        needed_indices
+                            .iter()
+                            .map(|&i| full_schema.column_names()[i].clone())
+                            .collect(),
+                    );
+                    let total_cols = table_spec.column_specs.len();
+                    return Ok(Box::new(
+                        disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
+                            .with_needed_columns(needed_indices, total_cols),
+                    ));
                 }
             }
 
-            Ok(scan)
+            Ok(Box::new(disk::ScanOperator::new(
+                scan_data.table_id.clone(),
+                full_schema,
+            )))
         }
 
         QueryOp::Filter(filter_data) => {

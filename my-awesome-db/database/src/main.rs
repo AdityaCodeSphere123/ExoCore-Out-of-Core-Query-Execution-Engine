@@ -60,7 +60,7 @@ fn db_main() -> Result<()> {
     let mut buffer_manager = BufferManager::new(block_size, capacity)?;
 
     let usable_for_sort = memory_limit_bytes.saturating_sub(capacity * block_size);
-    let sort_run_bytes = std::cmp::max(block_size, usable_for_sort / 2);
+    let sort_run_bytes = std::cmp::max(block_size, usable_for_sort * 3 / 4);
     let mut temp_storage = TempStorageManager::new(block_size)?;
 
     executor::execute_query(

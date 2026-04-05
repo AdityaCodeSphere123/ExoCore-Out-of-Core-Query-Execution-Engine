@@ -31,6 +31,8 @@ pub fn schema_from_table_spec(table_spec: &TableSpec) -> RowSchema {
 pub struct ScanOperator {
     table_id: String,
     schema: RowSchema,
+    /// Per-column keep flag for late materialization.  Empty = keep all columns.
+    keep_columns: Vec<bool>,
     start_block: Option<u64>,
     num_blocks: Option<u64>,
     current_block_offset: u64,
@@ -43,12 +45,22 @@ impl ScanOperator {
         Self {
             table_id,
             schema,
+            keep_columns: Vec::new(),
             start_block: None,
             num_blocks: None,
             current_block_offset: 0,
             current_rows: None,
             prefetched_rows: VecDeque::new(),
         }
+    }
+
+    pub fn with_needed_columns(mut self, needed: Vec<usize>, total_columns: usize) -> Self {
+        let mut keep = vec![false; total_columns];
+        for i in needed {
+            keep[i] = true;
+        }
+        self.keep_columns = keep;
+        self
     }
 
     fn refill_prefetch_buffer(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<bool> {
@@ -87,10 +99,16 @@ impl ScanOperator {
             block_size,
         )?;
 
+        let keep = if self.keep_columns.is_empty() {
+            None
+        } else {
+            Some(self.keep_columns.as_slice())
+        };
+
         for block_idx in 0..batch_blocks {
             let start = block_idx * block_size;
             let end = start + block_size;
-            let block_rows = decode_block_into_rows(table_spec, &batch_buf[start..end])?;
+            let block_rows = decode_block_into_rows(table_spec, &batch_buf[start..end], keep)?;
             self.prefetched_rows.push_back(block_rows.into_iter());
         }
 
@@ -197,25 +215,66 @@ where
     Ok(buf)
 }
 
-pub fn decode_block_into_rows(table_spec: &TableSpec, block: &[u8]) -> Result<Vec<Row>> {
+pub fn decode_block_into_rows(
+    table_spec: &TableSpec,
+    block: &[u8],
+    keep: Option<&[bool]>,
+) -> Result<Vec<Row>> {
     let buf = BlockBuffer::new(block);
     let row_count = buf.row_count()?;
     let mut offset = 0usize;
 
+    let num_kept = keep
+        .map(|k| k.iter().filter(|&&v| v).count())
+        .unwrap_or(table_spec.column_specs.len());
     let mut rows = Vec::with_capacity(row_count);
 
     for _ in 0..row_count {
-        let mut values = Vec::with_capacity(table_spec.column_specs.len());
+        let mut values = Vec::with_capacity(num_kept);
 
-        for col in &table_spec.column_specs {
-            let value = match &col.data_type {
-                DataType::Int32 => Data::Int32(buf.read_i32(&mut offset)?),
-                DataType::Int64 => Data::Int64(buf.read_i64(&mut offset)?),
-                DataType::Float32 => Data::Float32(buf.read_f32(&mut offset)?),
-                DataType::Float64 => Data::Float64(buf.read_f64(&mut offset)?),
-                DataType::String => Data::String(buf.read_cstring(&mut offset)?),
-            };
-            values.push(value);
+        for (col_idx, col) in table_spec.column_specs.iter().enumerate() {
+            let needed = keep.map(|k| k[col_idx]).unwrap_or(true);
+            match &col.data_type {
+                DataType::Int32 => {
+                    if needed {
+                        values.push(Data::Int32(buf.read_i32(&mut offset)?));
+                    } else {
+                        buf.ensure_bytes(offset, 4)?;
+                        offset += 4;
+                    }
+                }
+                DataType::Int64 => {
+                    if needed {
+                        values.push(Data::Int64(buf.read_i64(&mut offset)?));
+                    } else {
+                        buf.ensure_bytes(offset, 8)?;
+                        offset += 8;
+                    }
+                }
+                DataType::Float32 => {
+                    if needed {
+                        values.push(Data::Float32(buf.read_f32(&mut offset)?));
+                    } else {
+                        buf.ensure_bytes(offset, 4)?;
+                        offset += 4;
+                    }
+                }
+                DataType::Float64 => {
+                    if needed {
+                        values.push(Data::Float64(buf.read_f64(&mut offset)?));
+                    } else {
+                        buf.ensure_bytes(offset, 8)?;
+                        offset += 8;
+                    }
+                }
+                DataType::String => {
+                    if needed {
+                        values.push(Data::String(buf.read_cstring(&mut offset)?));
+                    } else {
+                        buf.skip_cstring(&mut offset)?;
+                    }
+                }
+            }
         }
 
         rows.push(Row::new(values));

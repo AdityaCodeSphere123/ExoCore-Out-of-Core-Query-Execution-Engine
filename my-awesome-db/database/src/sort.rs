@@ -64,7 +64,10 @@ impl<'a> SortOperator<'a> {
             bytes_used += estimate_row_size(&row);
             rows.push(row);
 
-            if bytes_used >= ctx.sort_run_bytes && !rows.is_empty() {
+            // Include Vec<Row>'s own backing-store overhead (capacity × 24 bytes
+            // for Row structs inline) which isn't tracked per-row.
+            let total_mem = bytes_used + rows.capacity() * std::mem::size_of::<Row>();
+            if total_mem >= ctx.sort_run_bytes && !rows.is_empty() {
                 sort_rows(&mut rows, &self.sort_keys);
                 let run_id = spill_run(ctx, &rows)?;
                 run_ids.push(run_id);
@@ -160,11 +163,12 @@ fn compare_data(left: &Data, right: &Data) -> Result<Ordering> {
 fn estimate_row_size(row: &Row) -> usize {
     use std::mem::size_of;
 
-    let mut total = size_of::<Row>() + row.len() * size_of::<Data>();
+    // 16 bytes: heap allocator metadata for the Vec<Data> backing store
+    let mut total = size_of::<Row>() + row.len() * size_of::<Data>() + 16;
 
     for value in row.values() {
         if let Data::String(s) = value {
-            total += s.capacity();
+            total += s.capacity() + 16; // +16 for string heap alloc metadata
         }
     }
 
@@ -186,12 +190,23 @@ impl RunMerger {
         let mut readers = Vec::with_capacity(run_ids.len());
         let mut heap = BinaryHeap::new();
 
+        // Spread available memory across all run readers so each gets a
+        // larger batch buffer, drastically reducing seek count during merge.
+        let block_size = ctx.temp_storage.block_size();
+        let num_runs = run_ids.len();
+        let reader_batch_pages = if num_runs > 0 && block_size > 0 {
+            (ctx.sort_run_bytes / (num_runs * block_size)).max(1).min(256)
+        } else {
+            16
+        };
+
         let disk_reader = &mut *ctx.disk_reader;
         let disk_writer = &mut *ctx.disk_writer;
         let temp_storage = &*ctx.temp_storage;
 
         for (run_idx, run_id) in run_ids.into_iter().enumerate() {
-            let mut reader = TempRunReader::new(temp_storage, run_id)?;
+            let mut reader =
+                TempRunReader::with_batch_pages(temp_storage, run_id, reader_batch_pages)?;
             if let Some(row) = reader.next_row(temp_storage, disk_reader, disk_writer)? {
                 heap.push(HeapItem {
                     row,

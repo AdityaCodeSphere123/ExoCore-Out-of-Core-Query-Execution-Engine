@@ -77,3 +77,15 @@ Disk IO metrics DiskIOMetricsResult {
     total_rotational_latency_us: 12145834,
     total_transfer_time_us: 1170229,
 } 
+
+# claude optimizations p2
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1530,
+    total_writes: 928,
+    total_blocks_processed: 42859,
+    total_cylinders_traveled: 238466,
+    total_io_time_us: 5857977,
+    total_seek_time_us: 825139,
+    total_rotational_latency_us: 3862500,
+    total_transfer_time_us: 1170337,
+}

@@ -320,6 +320,7 @@ pub struct TempRunWriter {
     pending_pages_buf: Vec<u8>,
     pending_pages: u64,
     finished: bool,
+    encode_buf: Vec<u8>,
 }
 
 impl TempRunWriter {
@@ -353,6 +354,7 @@ impl TempRunWriter {
             pending_pages_buf,
             pending_pages: 0,
             finished: false,
+            encode_buf: Vec::with_capacity(256),
         })
     }
 
@@ -375,8 +377,8 @@ impl TempRunWriter {
             bail!("cannot append to finalized temp run {}", self.file_id.0);
         }
 
-        let encoded = encode_row(row)?;
-        let record_len = 4 + encoded.len();
+        encode_row_into(row, &mut self.encode_buf)?;
+        let record_len = 4 + self.encode_buf.len();
         let usable_end = self.page_buf.len() - 2;
 
         if record_len > usable_end {
@@ -391,12 +393,12 @@ impl TempRunWriter {
             self.flush_current_page(storage, disk_reader, disk_writer)?;
         }
 
-        let len_bytes = (encoded.len() as u32).to_le_bytes();
+        let len_bytes = (self.encode_buf.len() as u32).to_le_bytes();
         self.page_buf[self.page_offset..self.page_offset + 4].copy_from_slice(&len_bytes);
         self.page_offset += 4;
-        self.page_buf[self.page_offset..self.page_offset + encoded.len()]
-            .copy_from_slice(&encoded);
-        self.page_offset += encoded.len();
+        self.page_buf[self.page_offset..self.page_offset + self.encode_buf.len()]
+            .copy_from_slice(&self.encode_buf);
+        self.page_offset += self.encode_buf.len();
         self.row_count += 1;
         Ok(())
     }
@@ -683,8 +685,8 @@ where
     Ok(())
 }
 
-fn encode_row(row: &Row) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+fn encode_row_into(row: &Row, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
 
     let field_count: u16 = row
         .len()
@@ -723,7 +725,7 @@ fn encode_row(row: &Row) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 fn decode_row_from_page(page: &[u8], offset: &mut usize) -> Result<Row> {

@@ -89,4 +89,19 @@ impl<'a> BlockBuffer<'a> {
         *offset += 1;
         Ok(s)
     }
+
+    pub fn skip_cstring(&self, offset: &mut usize) -> Result<()> {
+        let usable_end = self.usable_end()?;
+
+        while *offset < usable_end && self.data[*offset] != 0 {
+            *offset += 1;
+        }
+
+        if *offset >= usable_end {
+            bail!("unterminated string while skipping in row decode");
+        }
+
+        *offset += 1; // skip null terminator
+        Ok(())
+    }
 }
