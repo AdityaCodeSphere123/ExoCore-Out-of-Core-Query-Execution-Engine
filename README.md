@@ -65,3 +65,15 @@ Disk IO metrics DiskIOMetricsResult {
     total_rotational_latency_us: 12429168,
     total_transfer_time_us: 1181971,
 }
+
+# optimized join
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 2677,
+    total_writes: 2368,
+    total_blocks_processed: 42855,
+    total_cylinders_traveled: 1855391,
+    total_io_time_us: 15335025,
+    total_seek_time_us: 2018962,
+    total_rotational_latency_us: 12145834,
+    total_transfer_time_us: 1170229,
+} 
