@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use libc::{rlimit, setrlimit};
+use libc::{rlimit64, setrlimit64};
 use monitor_config::{
     MonitorConfig,
     monitor_config::{DatabaseConfig, QueryConfig},
@@ -68,34 +68,28 @@ fn setup_db_process(
                 FdMapping::new(db_to_monitor_writer.as_raw_fd(), 6, false),
             ]);
 
-            let mut rlimit = rlimit {
+            let mut rlimit = rlimit64 {
                 rlim_cur: memory_limit,
                 rlim_max: memory_limit,
             };
 
-            if setrlimit(libc::RLIMIT_AS, &rlimit) != 0 {
-                #[cfg(not(target_os = "macos"))]
+            if setrlimit64(libc::RLIMIT_AS, &rlimit) != 0 {
                 panic!("Unable to set memory limit");
-                #[cfg(target_os = "macos")]
-                eprintln!("Warning: Unable to set memory limit (RLIMIT_AS) on macOS.");
             }
 
-            if setrlimit(libc::RLIMIT_STACK, &rlimit) != 0 {
-                #[cfg(not(target_os = "macos"))]
+            if setrlimit64(libc::RLIMIT_STACK, &rlimit) != 0 {
                 panic!("Unable to set stack limit");
-                #[cfg(target_os = "macos")]
-                eprintln!("Warning: Unable to set stack limit (RLIMIT_STACK) on macOS.");
             }
 
             rlimit.rlim_cur = 0;
             rlimit.rlim_max = 0;
-            if setrlimit(libc::RLIMIT_FSIZE, &rlimit) != 0 {
+            if setrlimit64(libc::RLIMIT_FSIZE, &rlimit) != 0 {
                 panic!("Unable to set max file size limit");
             }
 
             rlimit.rlim_cur = 1;
             rlimit.rlim_max = 1;
-            if setrlimit(libc::RLIMIT_NPROC, &rlimit) != 0 {
+            if setrlimit64(libc::RLIMIT_NPROC, &rlimit) != 0 {
                 panic!("Unable to set max processes limit");
             }
 
@@ -108,7 +102,68 @@ fn setup_db_process(
     Ok((db_process_child, db_to_monitor_reader, monitor_to_db_writer))
 }
 
-fn validate(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+    let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
+    let mut expected_rows = Vec::new();
+    loop {
+        let mut row = String::new();
+        expected_output_reader
+            .read_line(&mut row)
+            .context("Failed to read row from expected output file")?;
+        let trimmed_row = row.trim();
+        if trimmed_row.len() == 0 {
+            break;
+        }
+        expected_rows.push(trimmed_row.to_string());
+    }
+
+    let mut db_output_rows = Vec::new();
+
+    loop {
+        let mut db_in_line = String::new();
+        db_in
+            .read_line(&mut db_in_line)
+            .context("Failed to read line from database output")?;
+
+        if db_in_line.trim() == "!" {
+            if db_output_rows.len() != expected_rows.len() {
+                bail!(
+                    "Number of rows didn't match, expected {} but found {}",
+                    expected_rows.len(),
+                    db_output_rows.len()
+                );
+            }
+            break;
+        }
+        if db_output_rows.len() == expected_rows.len() {
+            bail!(
+                "Expected end of row `!`, but db outputed additional row {}",
+                db_in_line
+            );
+        }
+        if db_in_line.trim().len() == 0 {
+            bail!("Empty line found");
+        }
+        db_output_rows.push(db_in_line.trim().to_string());
+    }
+
+    expected_rows.sort();
+    db_output_rows.sort();
+
+    for (expected_row, db_row) in expected_rows.iter().zip(db_output_rows.iter()) {
+        if !expected_row.eq(db_row) {
+            bail!(
+                "Expected line output\n{}\nbut database returned\n{}",
+                expected_row,
+                db_row
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_presorted(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
     let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
     let mut line_count = 0;
 
@@ -130,7 +185,6 @@ fn validate(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Re
         }
 
         if expected_output_line.trim() != db_in_line.trim() {
-            eprintln!("mismatch {},{}",expected_output_line,db_in_line);
             bail!(
                 "Expected line output\n{}\nbut database returned\n{}\nerror at line {line_count}",
                 expected_output_line,
@@ -162,7 +216,10 @@ fn handle_db(
                 db_out.write_all(format!("{}\n", query_config.memory_limit_mb).as_bytes())?;
             }
             "validate" => {
-                validate(db_in, &query_config.expected_output_file)?;
+                match query_config.sort_before_check {
+                    true => validate_bysorting(db_in, &query_config.expected_output_file),
+                    false => validate_presorted(db_in, &query_config.expected_output_file),
+                }?;
                 return Ok(());
             }
             other => bail!("Unknown command: {other}"),
@@ -212,7 +269,12 @@ fn monitor_main() -> Result<()> {
         let mut db_in = BufReader::new(db_outbound_reader);
         let db_result = handle_db(&mut db_in, &mut db_inbound_writer, &query_config);
 
-        db_process.wait()?;
+        if let Err(_) = &db_result {
+            db_process.kill()?;
+        } else {
+            db_process.wait()?;
+        }
+
         disk_process.wait()?;
 
         println!(
