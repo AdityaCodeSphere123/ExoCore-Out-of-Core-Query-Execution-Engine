@@ -1,14 +1,24 @@
 use anyhow::{anyhow, bail, Result};
 use common::Data;
+use std::collections::HashMap;
 
+// RowSchema stores a HashMap alongside the Vec so that index_of / contains are
+// O(1) instead of O(n).  This matters because these are called on every row
+// during filter evaluation, join key resolution, and column-pruning.
 #[derive(Debug, Clone)]
 pub struct RowSchema {
     column_names: Vec<String>,
+    name_to_idx: HashMap<String, usize>,
 }
 
 impl RowSchema {
     pub fn new(column_names: Vec<String>) -> Self {
-        Self { column_names }
+        let name_to_idx = column_names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+        Self { column_names, name_to_idx }
     }
 
     pub fn len(&self) -> usize {
@@ -24,7 +34,7 @@ impl RowSchema {
     }
 
     pub fn index_of(&self, column_name: &str) -> Option<usize> {
-        self.column_names.iter().position(|c| c == column_name)
+        self.name_to_idx.get(column_name).copied()
     }
 
     pub fn require_index(&self, column_name: &str) -> Result<usize> {
@@ -33,11 +43,14 @@ impl RowSchema {
     }
 
     pub fn contains(&self, column_name: &str) -> bool {
-        self.index_of(column_name).is_some()
+        self.name_to_idx.contains_key(column_name)
     }
 
     pub fn push_column(&mut self, column_name: impl Into<String>) {
-        self.column_names.push(column_name.into());
+        let col = column_name.into();
+        let idx = self.column_names.len();
+        self.name_to_idx.insert(col.clone(), idx);
+        self.column_names.push(col);
     }
 
     pub fn project(&self, selected_columns: &[String]) -> Result<Self> {
@@ -117,6 +130,22 @@ impl Row {
         vals.extend(left.values.iter().cloned());
         vals.extend(right.values.iter().cloned());
         Row::new(vals)
+    }
+
+    /// Estimate the total heap memory this row occupies, including the Vec
+    /// backing store and any String heap allocations.  Used by sort and join
+    /// operators to budget memory usage.  Previously duplicated in sort.rs and
+    /// join.rs; canonical home is here.
+    pub fn estimate_heap_size(&self) -> usize {
+        use std::mem::size_of;
+        // Row struct + Vec<Data> elements + Vec allocator metadata
+        let mut total = size_of::<Row>() + self.values.len() * size_of::<Data>() + 16;
+        for value in &self.values {
+            if let Data::String(s) = value {
+                total += s.capacity() + 16; // +16 for String's heap allocator metadata
+            }
+        }
+        total
     }
 
     pub fn to_pipe_string(&self) -> String {

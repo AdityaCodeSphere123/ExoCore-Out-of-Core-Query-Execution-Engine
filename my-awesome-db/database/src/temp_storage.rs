@@ -33,6 +33,13 @@ pub struct TempStorageManager {
     next_file_id: u64,
     next_free_block: Option<u64>,
     files: HashMap<TempFileId, TempFileMeta>,
+    /// Extents returned by `delete_temp_file`, available for reuse.
+    /// Each entry is (start_block, num_pages).  Without recycling, every
+    /// deleted temp file's disk space is lost for the lifetime of the query
+    /// (next_free_block only ever grows).  This is especially costly for
+    /// Grace Hash Join which creates and immediately discards ~64 partition
+    /// files per join operator.
+    free_extents: Vec<(u64, u64)>,
 }
 
 impl TempStorageManager {
@@ -46,6 +53,7 @@ impl TempStorageManager {
             next_file_id: 0,
             next_free_block: None,
             files: HashMap::new(),
+            free_extents: Vec::new(),
         })
     }
 
@@ -61,9 +69,15 @@ impl TempStorageManager {
     }
 
     pub fn delete_temp_file(&mut self, file_id: TempFileId) -> Result<()> {
-        self.files
+        let meta = self
+            .files
             .remove(&file_id)
             .ok_or_else(|| anyhow!("unknown temp file id {}", file_id.0))?;
+        // Return all extents to the free list.  Subsequent allocations will
+        // reuse them before extending the anonymous disk region.
+        for extent in meta.extents {
+            self.free_extents.push((extent.start_block, extent.num_pages));
+        }
         Ok(())
     }
 
@@ -224,15 +238,38 @@ impl TempStorageManager {
             bail!("cannot allocate zero-page extent");
         }
 
-        self.ensure_anon_region_initialized(disk_reader, disk_writer)?;
+        // Check the free list before consuming new disk space.
+        //   Best-fit: pick the smallest free extent that is >= num_pages.
+        //   This minimises leftover fragments compared with first-fit, keeping
+        //   the free list compact and future allocations more likely to be
+        //   contiguous — which reduces rotational latency during reads.
+        let best_pos = self
+            .free_extents
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(_, n))| n >= num_pages)
+            .min_by_key(|&(_, &(_, n))| n)
+            .map(|(pos, _)| pos);
 
-        let start_block = self
-            .next_free_block
-            .ok_or_else(|| anyhow!("anonymous region start block not initialized"))?;
-        let next_block = start_block
-            .checked_add(num_pages)
-            .ok_or_else(|| anyhow!("anonymous region block id overflow"))?;
-        self.next_free_block = Some(next_block);
+        let start_block = if let Some(pos) = best_pos {
+            let (start, total) = self.free_extents.swap_remove(pos);
+            if total > num_pages {
+                // Put the leftover pages back as a smaller free extent.
+                self.free_extents.push((start + num_pages, total - num_pages));
+            }
+            start
+        } else {
+            self.ensure_anon_region_initialized(disk_reader, disk_writer)?;
+            let start = self
+                .next_free_block
+                .ok_or_else(|| anyhow!("anonymous region start block not initialized"))?;
+            self.next_free_block = Some(
+                start
+                    .checked_add(num_pages)
+                    .ok_or_else(|| anyhow!("anonymous region block id overflow"))?,
+            );
+            start
+        };
 
         let meta = self.file_meta_mut(file_id)?;
         let start_page_index = meta.num_pages;

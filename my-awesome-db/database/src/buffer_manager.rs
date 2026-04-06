@@ -14,6 +14,9 @@ pub struct BufferManager {
     frames: Vec<Option<Frame>>,
     page_table: HashMap<u64, usize>,
     fifo_queue: VecDeque<u64>,
+    // Indices of frames that have never held a page (or were freed).
+    // Popping here is O(1) vs the previous O(capacity) linear scan.
+    free_frames: VecDeque<usize>,
 }
 
 impl BufferManager {
@@ -24,6 +27,7 @@ impl BufferManager {
 
         let mut frames = Vec::with_capacity(capacity);
         frames.resize_with(capacity, || None);
+        let free_frames = (0..capacity).collect();
 
         Ok(Self {
             block_size,
@@ -31,6 +35,7 @@ impl BufferManager {
             frames,
             page_table: HashMap::new(),
             fifo_queue: VecDeque::new(),
+            free_frames,
         })
     }
 
@@ -84,8 +89,8 @@ impl BufferManager {
         Ok(&frame.data)
     }
 
-    fn find_free_frame(&self) -> Option<usize> {
-        self.frames.iter().position(|f| f.is_none())
+    fn find_free_frame(&mut self) -> Option<usize> {
+        self.free_frames.pop_front()
     }
 
     fn evict_one(&mut self) -> Result<usize> {

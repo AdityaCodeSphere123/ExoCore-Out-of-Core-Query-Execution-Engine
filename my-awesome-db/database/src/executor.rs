@@ -1,6 +1,7 @@
-use anyhow::Result;
-use common::query::{ComparisionValue, Predicate, Query, QueryOp, SortSpec};
+use anyhow::{anyhow, Result};
+use common::query::{ComparisionOperator, ComparisionValue, Predicate, Query, QueryOp, SortSpec};
 use db_config::DbContext;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
@@ -14,6 +15,191 @@ use crate::row::RowSchema;
 use crate::sort;
 use crate::temp_storage::TempStorageManager;
 
+#[derive(Debug, Clone, Default)]
+pub struct StatsCatalog {
+    tables: HashMap<String, TableStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TableStats {
+    row_count: Option<f64>,
+    columns: HashMap<String, ColumnStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ColumnStats {
+    density: Option<f64>,
+    cardinality_rows: Option<f64>,
+    numeric_range: Option<(f64, f64)>,
+    string_range: Option<(String, String)>,
+    is_physically_ordered: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+enum ScalarValue {
+    Number(f64),
+    Text(String),
+}
+
+impl StatsCatalog {
+    pub fn from_config_path(path: &std::path::Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)?;
+        let json: Value = serde_json::from_str(&raw)?;
+        Ok(Self::from_json_value(&json))
+    }
+
+    fn from_json_value(root: &Value) -> Self {
+        let mut catalog = Self::default();
+        visit_json_for_tables(root, &mut catalog);
+        catalog
+    }
+
+    fn table(&self, table_id: &str) -> Option<&TableStats> {
+        self.tables.get(table_id)
+    }
+
+    fn column(&self, table_id: &str, column_name: &str) -> Option<&ColumnStats> {
+        self.table(table_id)?.columns.get(column_name)
+    }
+
+    fn row_count(&self, table_id: &str) -> Option<f64> {
+        self.table(table_id)?.row_count
+    }
+}
+
+fn visit_json_for_tables(value: &Value, catalog: &mut StatsCatalog) {
+    match value {
+        Value::Object(map) => {
+            if let Some(columns_value) = map.get("column_specs") {
+                if let Some(column_specs) = columns_value.as_array() {
+                    let mut table_stats = TableStats::default();
+                    for col_val in column_specs {
+                        let Some(col_obj) = col_val.as_object() else {
+                            continue;
+                        };
+                        let Some(col_name) = col_obj.get("column_name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let col_stats = parse_column_stats(col_obj.get("stats"));
+                        if let Some(rows) = col_stats.cardinality_rows {
+                            table_stats.row_count = Some(table_stats.row_count.unwrap_or(rows).max(rows));
+                        }
+                        table_stats.columns.insert(col_name.to_string(), col_stats);
+                    }
+                    if !table_stats.columns.is_empty() {
+                        if let Some(name) = map.get("name").and_then(Value::as_str) {
+                            catalog.tables.insert(name.to_string(), table_stats.clone());
+                        }
+                        if let Some(file_id) = map.get("file_id").and_then(Value::as_str) {
+                            catalog.tables.insert(file_id.to_string(), table_stats.clone());
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                visit_json_for_tables(child, catalog);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                visit_json_for_tables(child, catalog);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_column_stats(stats_value: Option<&Value>) -> ColumnStats {
+    let mut out = ColumnStats::default();
+    let Some(stats_value) = stats_value else {
+        return out;
+    };
+
+    match stats_value {
+        Value::Array(entries) => {
+            for entry in entries {
+                apply_stat_entry(entry, &mut out);
+            }
+        }
+        other => apply_stat_entry(other, &mut out),
+    }
+
+    out
+}
+
+fn apply_stat_entry(entry: &Value, out: &mut ColumnStats) {
+    let Some(obj) = entry.as_object() else {
+        return;
+    };
+
+    if let Some(v) = obj.get("CardinalityStat") {
+        out.cardinality_rows = value_as_f64(v);
+    }
+    if let Some(v) = obj.get("DensityStat") {
+        out.density = value_as_f64(v);
+    }
+    if let Some(v) = obj.get("IsPhysicallyOrdered") {
+        out.is_physically_ordered = Some(match v {
+            Value::Bool(b) => *b,
+            Value::Null => true,
+            _ => true,
+        });
+    }
+    if let Some(v) = obj.get("RangeStat") {
+        if let Some((lo, hi)) = parse_range_stat(v) {
+            match (lo, hi) {
+                (ScalarValue::Number(l), ScalarValue::Number(h)) => {
+                    out.numeric_range = Some((l.min(h), l.max(h)));
+                }
+                (ScalarValue::Text(l), ScalarValue::Text(h)) => {
+                    out.string_range = Some(if l <= h { (l, h) } else { (h, l) });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn parse_range_stat(value: &Value) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        Value::Object(obj) => {
+            let lower = obj.get("lower_bound").or_else(|| obj.get("lower"))?;
+            let upper = obj.get("upper_bound").or_else(|| obj.get("upper"))?;
+            Some((json_to_scalar(lower)?, json_to_scalar(upper)?))
+        }
+        Value::Array(arr) if arr.len() >= 2 => Some((json_to_scalar(&arr[0])?, json_to_scalar(&arr[1])?)),
+        _ => None,
+    }
+}
+
+fn json_to_scalar(value: &Value) -> Option<ScalarValue> {
+    match value {
+        Value::Number(n) => n.as_f64().map(ScalarValue::Number),
+        Value::String(s) => Some(ScalarValue::Text(s.clone())),
+        Value::Object(obj) if obj.len() == 1 => {
+            let (k, v) = obj.iter().next()?;
+            match k.as_str() {
+                "I32" | "I64" | "F32" | "F64" => value_as_f64(v).map(ScalarValue::Number),
+                "String" => v.as_str().map(|s| ScalarValue::Text(s.to_string())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Object(obj) if obj.len() == 1 => {
+            let (_, inner) = obj.iter().next()?;
+            value_as_f64(inner)
+        }
+        _ => None,
+    }
+}
+
 pub fn execute_query<RDisk, WDisk, WMon>(
     ctx: &DbContext,
     query: &Query,
@@ -23,13 +209,14 @@ pub fn execute_query<RDisk, WDisk, WMon>(
     buffer_manager: &mut BufferManager,
     temp_storage: &mut TempStorageManager,
     sort_run_bytes: usize,
+    stats_catalog: &StatsCatalog,
 ) -> Result<()>
 where
     RDisk: BufRead,
     WDisk: Write,
     WMon: Write,
 {
-    let mut operator = execute_op_tree(ctx, &query.root, None)?;
+    let mut operator = execute_op_tree(ctx, &query.root, None, stats_catalog)?;
     let mut exec_ctx = ExecContext {
         db_ctx: ctx,
         disk_reader,
@@ -49,73 +236,35 @@ where
     Ok(())
 }
 
-/// Build the operator tree, propagating `needed_above` (the set of column names
-/// required by ancestors) downward so that scans can be wrapped in an early
-/// projection that trims unused columns.
-///
-/// `needed_above = None` means "all columns are needed" (no pruning).
-/// A `Project` node acts as a barrier: it replaces the needed set with exactly
-/// the source columns it maps from.
 fn execute_op_tree<'a>(
     ctx: &DbContext,
     op: &'a QueryOp,
     needed_above: Option<&HashSet<String>>,
+    stats_catalog: &StatsCatalog,
 ) -> Result<Box<dyn Operator + 'a>> {
     match op {
-        QueryOp::Scan(scan_data) => {
-            let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
-            let full_schema = disk::schema_from_table_spec(table_spec);
-
-            // Late materialization: push column pruning into the scan itself
-            // so unneeded columns are never decoded (skips string allocs, etc.).
-            if let Some(needed) = needed_above {
-                let needed_indices: Vec<usize> = full_schema
-                    .column_names()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| needed.contains(c.as_str()))
-                    .map(|(i, _)| i)
-                    .collect();
-
-                if !needed_indices.is_empty() && needed_indices.len() < full_schema.len() {
-                    let pruned_schema = RowSchema::new(
-                        needed_indices
-                            .iter()
-                            .map(|&i| full_schema.column_names()[i].clone())
-                            .collect(),
-                    );
-                    let total_cols = table_spec.column_specs.len();
-                    return Ok(Box::new(
-                        disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
-                            .with_needed_columns(needed_indices, total_cols),
-                    ));
-                }
-            }
-
-            Ok(Box::new(disk::ScanOperator::new(
-                scan_data.table_id.clone(),
-                full_schema,
-            )))
-        }
+        QueryOp::Scan(scan_data) => build_scan_operator(ctx, scan_data, needed_above),
 
         QueryOp::Filter(filter_data) => {
-            let child_needed = add_predicate_columns(needed_above, &filter_data.predicates);
+            if let QueryOp::Cross(cross_data) = filter_data.underlying.as_ref() {
+                if let Some(plan) = try_build_flattened_spj_plan(
+                    ctx,
+                    cross_data,
+                    &filter_data.predicates,
+                    needed_above,
+                    stats_catalog,
+                )? {
+                    return Ok(plan);
+                }
 
-            // Rewrite Filter(Cross(...)) into a canonical SPJ-style left-deep plan:
-            // 1. flatten the cross tree into base relations/subtrees,
-            // 2. classify predicates by the relation(s) they touch,
-            // 3. push single-relation predicates to the leaves,
-            // 4. rebuild a connected join tree so predicates are applied as early as possible.
-            if let Some(rewritten) = try_build_flattened_spj_plan(
-                ctx,
-                filter_data.underlying.as_ref(),
-                &filter_data.predicates,
-                child_needed.as_ref(),
-            )? {
-                return Ok(rewritten);
+                let child_needed = add_predicate_columns(needed_above, &filter_data.predicates);
+                let left = execute_op_tree(ctx, &cross_data.left, child_needed.as_ref(), stats_catalog)?;
+                let right = execute_op_tree(ctx, &cross_data.right, child_needed.as_ref(), stats_catalog)?;
+                return join::build_join(left, right, &filter_data.predicates);
             }
 
-            let underlying = execute_op_tree(ctx, &filter_data.underlying, child_needed.as_ref())?;
+            let child_needed = add_predicate_columns(needed_above, &filter_data.predicates);
+            let underlying = execute_op_tree(ctx, &filter_data.underlying, child_needed.as_ref(), stats_catalog)?;
             Ok(Box::new(filter::FilterOperator::new(
                 underlying,
                 &filter_data.predicates,
@@ -123,18 +272,17 @@ fn execute_op_tree<'a>(
         }
 
         QueryOp::Cross(cross_data) => {
-            let left = execute_op_tree(ctx, &cross_data.left, needed_above)?;
-            let right = execute_op_tree(ctx, &cross_data.right, needed_above)?;
+            let left = execute_op_tree(ctx, &cross_data.left, needed_above, stats_catalog)?;
+            let right = execute_op_tree(ctx, &cross_data.right, needed_above, stats_catalog)?;
             join::build_join(left, right, &[])
         }
 
         QueryOp::Project(project_data) => {
-            // Project is a barrier: only source columns are needed from child.
             let mut child_needed = HashSet::new();
             for (source, _alias) in &project_data.column_name_map {
                 child_needed.insert(source.clone());
             }
-            let underlying = execute_op_tree(ctx, &project_data.underlying, Some(&child_needed))?;
+            let underlying = execute_op_tree(ctx, &project_data.underlying, Some(&child_needed), stats_catalog)?;
             Ok(Box::new(project::ProjectOperator::new(
                 underlying,
                 &project_data.column_name_map,
@@ -143,7 +291,7 @@ fn execute_op_tree<'a>(
 
         QueryOp::Sort(sort_data) => {
             let child_needed = add_sort_columns(needed_above, &sort_data.sort_specs);
-            let underlying = execute_op_tree(ctx, &sort_data.underlying, child_needed.as_ref())?;
+            let underlying = execute_op_tree(ctx, &sort_data.underlying, child_needed.as_ref(), stats_catalog)?;
             Ok(Box::new(sort::SortOperator::new(
                 underlying,
                 &sort_data.sort_specs,
@@ -152,153 +300,300 @@ fn execute_op_tree<'a>(
     }
 }
 
-#[derive(Debug)]
-struct FlattenedLeaf<'a> {
-    index: usize,
-    op: &'a QueryOp,
-    schema: RowSchema,
-    mask: u64,
-}
+fn build_scan_operator<'a>(
+    ctx: &DbContext,
+    scan_data: &'a common::query::ScanData,
+    needed_above: Option<&HashSet<String>>,
+) -> Result<Box<dyn Operator + 'a>> {
+    let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
+    let full_schema = disk::schema_from_table_spec(table_spec);
 
-#[derive(Debug, Clone)]
-struct ClassifiedPredicate {
-    predicate: Predicate,
-    relation_mask: u64,
+    if let Some(needed) = needed_above {
+        let needed_indices: Vec<usize> = full_schema
+            .column_names()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| needed.contains(c.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+
+        if !needed_indices.is_empty() && needed_indices.len() < full_schema.len() {
+            let pruned_schema = RowSchema::new(
+                needed_indices
+                    .iter()
+                    .map(|&i| full_schema.column_names()[i].clone())
+                    .collect(),
+            );
+            let total_cols = table_spec.column_specs.len();
+            return Ok(Box::new(
+                disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
+                    .with_needed_columns(needed_indices, total_cols),
+            ));
+        }
+    }
+
+    Ok(Box::new(disk::ScanOperator::new(
+        scan_data.table_id.clone(),
+        full_schema,
+    )))
 }
 
 fn try_build_flattened_spj_plan<'a>(
     ctx: &DbContext,
-    underlying: &'a QueryOp,
+    cross_root: &'a common::query::CrossData,
     predicates: &[Predicate],
     needed_above: Option<&HashSet<String>>,
+    stats_catalog: &StatsCatalog,
 ) -> Result<Option<Box<dyn Operator + 'a>>> {
-    let QueryOp::Cross(_) = underlying else {
-        return Ok(None);
-    };
+    let mut leaf_ops = Vec::new();
+    flatten_cross_inputs(&cross_root.left, &mut leaf_ops);
+    flatten_cross_inputs(&cross_root.right, &mut leaf_ops);
 
-    let mut raw_leaves = Vec::new();
-    flatten_cross_inputs(underlying, &mut raw_leaves);
-
-    if raw_leaves.len() <= 1 || raw_leaves.len() > 63 {
+    if leaf_ops.len() < 2 {
         return Ok(None);
     }
 
-    let mut leaves = Vec::with_capacity(raw_leaves.len());
-    let mut column_owner: HashMap<String, usize> = HashMap::new();
-
-    for (idx, leaf_op) in raw_leaves.into_iter().enumerate() {
-        let schema = logical_schema(ctx, leaf_op)?;
-
-        // If column names are not globally unique, we cannot safely classify
-        // predicates without a fuller name-resolution layer. Fall back.
-        for col in schema.column_names() {
-            if column_owner.insert(col.clone(), idx).is_some() {
-                return Ok(None);
-            }
-        }
-
-        leaves.push(FlattenedLeaf {
-            index: idx,
+    let mut leaves = Vec::with_capacity(leaf_ops.len());
+    for (idx, leaf_op) in leaf_ops.into_iter().enumerate() {
+        leaves.push(SpjLeaf {
+            original_pos: idx,
             op: leaf_op,
-            schema,
-            mask: 1u64 << idx,
+            schema: logical_schema(ctx, leaf_op)?,
         });
     }
 
-    let classified = match classify_predicates(predicates, &column_owner) {
-        Some(v) => v,
+    let classification = match classify_predicates(&leaves, predicates)? {
+        Some(c) => c,
         None => return Ok(None),
     };
 
-    let mut leaf_needed: Vec<HashSet<String>> = vec![HashSet::new(); leaves.len()];
+    let needed_by_leaf = compute_needed_by_leaf(
+        needed_above,
+        &leaves,
+        &classification.join_predicates,
+        &classification.residual_predicates,
+    );
 
-    // Columns needed by ancestors.
-    if let Some(needed) = needed_above {
-        for col in needed {
-            let Some(&owner) = column_owner.get(col) else {
-                return Ok(None);
-            };
-            leaf_needed[owner].insert(col.clone());
-        }
-    }
+    let order = if classification.join_predicates.is_empty() {
+        (0..leaves.len()).collect()
+    } else if let Some(order) = choose_left_deep_dp_order(
+        &leaves,
+        &classification.local_predicates,
+        &classification.join_predicates,
+        &classification.residual_predicates,
+        needed_above,
+        needed_by_leaf.as_ref(),
+        stats_catalog,
+    ) {
+        order
+    } else {
+        (0..leaves.len()).collect()
+    };
 
-    // Columns needed to evaluate pushed-down filters and future joins.
-    for pred in &classified {
-        add_predicate_columns_to_leaf_sets(&mut leaf_needed, &column_owner, &pred.predicate)?;
-    }
+    let mut current_subset: Vec<usize> = Vec::new();
+    let mut current_mask: usize = 0;
+    let mut current_plan: Option<Box<dyn Operator + 'a>> = None;
+    // Running row-count estimate for the accumulated left-side plan.  Used to
+    // give BNLJ a hint about which side to spill (the smaller one).
+    let mut current_rows: f64 = 1.0;
 
-    let local_predicates = group_local_predicates(&classified, leaves.len());
-    let join_order = choose_greedy_connected_order(&leaves, &classified);
+    for &leaf_idx in &order {
+        // Estimate rows for this leaf after applying its local predicates.
+        let leaf_base = estimate_base_rows_for_leaf(leaves[leaf_idx].op, stats_catalog)
+            .unwrap_or(DEFAULT_BASE_REL_ROWS);
+        let leaf_sel = estimate_local_selectivity_for_leaf(
+            leaves[leaf_idx].op,
+            &classification.local_predicates[leaf_idx],
+            stats_catalog,
+        );
+        let leaf_rows = (leaf_base * leaf_sel).max(1.0);
 
-    let mut built_ops: Vec<Option<Box<dyn Operator + 'a>>> = Vec::with_capacity(leaves.len());
-    for leaf in &leaves {
-        let needed = if leaf_needed[leaf.index].is_empty() {
-            None
+        let leaf_needed = needed_by_leaf.as_ref().map(|sets| &sets[leaf_idx]);
+        let leaf_plan = execute_single_relation_leaf(
+            ctx,
+            leaves[leaf_idx].op,
+            &classification.local_predicates[leaf_idx],
+            leaf_needed,
+            stats_catalog,
+        )?;
+
+        let join_preds = if current_plan.is_some() {
+            collect_join_preds_for_step(
+                &classification.join_predicates,
+                &current_subset,
+                leaf_idx,
+            )
         } else {
-            Some(&leaf_needed[leaf.index])
+            Vec::new()
         };
 
-        let mut op = execute_op_tree(ctx, leaf.op, needed)?;
+        current_plan = Some(if let Some(left_plan) = current_plan {
+            // Pass row-count hints so BNLJ can pick the smaller side to spill.
+            join::build_join_hinted(left_plan, leaf_plan, &join_preds, current_rows, leaf_rows)?
+        } else {
+            leaf_plan
+        });
 
-        if !local_predicates[leaf.index].is_empty() {
-            op = Box::new(filter::FilterOperator::new(op, &local_predicates[leaf.index])?);
+        // Update the accumulated row estimate for the next join step.
+        if current_subset.is_empty() {
+            current_rows = leaf_rows;
+        } else {
+            let has_equi = join_preds
+                .iter()
+                .any(|p| matches!(p.operator, ComparisionOperator::EQ));
+            let join_sel = if has_equi { EQ_JOIN_SELECTIVITY } else { OTHER_JOIN_SELECTIVITY };
+            current_rows = (current_rows * leaf_rows * join_sel).max(1.0);
         }
 
-        built_ops.push(Some(op));
+        current_subset.push(leaf_idx);
+        current_mask |= 1usize << leaf_idx;
+        let keep_cols = compute_needed_columns_for_subset(
+            current_mask,
+            &leaves,
+            &classification.join_predicates,
+            &classification.residual_predicates,
+            needed_above,
+        );
+        let plan = current_plan.take().expect("current plan must exist");
+        current_plan = Some(trim_plan_to_needed(plan, &keep_cols)?);
     }
 
-    let mut placed = vec![false; classified.len()];
-    for (pred_idx, pred) in classified.iter().enumerate() {
-        if pred.relation_mask.count_ones() <= 1 {
-            placed[pred_idx] = true;
-        }
+    let mut plan = current_plan.ok_or_else(|| anyhow!("failed to build SPJ plan"))?;
+    if !classification.residual_predicates.is_empty() {
+        plan = Box::new(filter::FilterOperator::new(
+            plan,
+            &classification.residual_predicates,
+        )?);
     }
 
-    let first_idx = join_order[0];
-    let mut current_mask = leaves[first_idx].mask;
-    let mut current_op = built_ops[first_idx]
-        .take()
-        .expect("flattened leaf must exist");
+    Ok(Some(plan))
+}
 
-    for &next_idx in join_order.iter().skip(1) {
-        let next_mask = leaves[next_idx].mask;
-        let available_mask = current_mask | next_mask;
-        let mut join_preds = Vec::new();
-
-        for (pred_idx, pred) in classified.iter().enumerate() {
-            if placed[pred_idx] {
-                continue;
+fn execute_single_relation_leaf<'a>(
+    ctx: &DbContext,
+    op: &'a QueryOp,
+    local_predicates: &[Predicate],
+    needed_above: Option<&HashSet<String>>,
+    stats_catalog: &StatsCatalog,
+) -> Result<Box<dyn Operator + 'a>> {
+    match op {
+        QueryOp::Scan(scan_data) => {
+            let needed = add_predicate_columns(needed_above, local_predicates);
+            let scan = build_scan_operator(ctx, scan_data, needed.as_ref())?;
+            if local_predicates.is_empty() {
+                Ok(scan)
+            } else {
+                Ok(Box::new(filter::FilterOperator::new(scan, local_predicates)?))
             }
-
-            if (pred.relation_mask & current_mask) != 0
-                && (pred.relation_mask & next_mask) != 0
-                && (pred.relation_mask & !available_mask) == 0
-            {
-                join_preds.push(pred.predicate.clone());
-                placed[pred_idx] = true;
-            }
         }
 
-        let right_op = built_ops[next_idx]
-            .take()
-            .expect("flattened leaf must exist");
-        current_op = join::build_join(current_op, right_op, &join_preds)?;
-        current_mask = available_mask;
-    }
+        QueryOp::Filter(filter_data) => {
+            let mut merged = filter_data.predicates.clone();
+            merged.extend_from_slice(local_predicates);
+            execute_single_relation_leaf(ctx, &filter_data.underlying, &merged, needed_above, stats_catalog)
+        }
 
-    // Safety net: if anything was not attached during rebuilding, evaluate it once at the end.
-    let residual_predicates: Vec<Predicate> = classified
+        QueryOp::Sort(sort_data) => {
+            let child_needed = add_sort_columns(needed_above, &sort_data.sort_specs);
+            let child = execute_single_relation_leaf(
+                ctx,
+                &sort_data.underlying,
+                local_predicates,
+                child_needed.as_ref(),
+                stats_catalog,
+            )?;
+            Ok(Box::new(sort::SortOperator::new(child, &sort_data.sort_specs)?))
+        }
+
+        QueryOp::Project(project_data) => {
+            let remapped_needed = remap_needed_through_project(needed_above, &project_data.column_name_map);
+            let remapped_preds = remap_predicates_through_project(local_predicates, &project_data.column_name_map)?;
+            let child = execute_single_relation_leaf(
+                ctx,
+                &project_data.underlying,
+                &remapped_preds,
+                remapped_needed.as_ref(),
+                stats_catalog,
+            )?;
+            Ok(Box::new(project::ProjectOperator::new(
+                child,
+                &project_data.column_name_map,
+            )?))
+        }
+
+        QueryOp::Cross(_) => {
+            let child_needed = add_predicate_columns(needed_above, local_predicates);
+            let child = execute_op_tree(ctx, op, child_needed.as_ref(), stats_catalog)?;
+            if local_predicates.is_empty() {
+                Ok(child)
+            } else {
+                Ok(Box::new(filter::FilterOperator::new(child, local_predicates)?))
+            }
+        }
+    }
+}
+
+fn remap_needed_through_project(
+    needed_above: Option<&HashSet<String>>,
+    column_name_map: &[(String, String)],
+) -> Option<HashSet<String>> {
+    needed_above.map(|needed| {
+        let alias_to_source: HashMap<&str, &str> = column_name_map
+            .iter()
+            .map(|(source, alias)| (alias.as_str(), source.as_str()))
+            .collect();
+
+        let mut remapped = HashSet::new();
+        for col in needed {
+            if let Some(source) = alias_to_source.get(col.as_str()) {
+                remapped.insert((*source).to_string());
+            } else {
+                remapped.insert(col.clone());
+            }
+        }
+        remapped
+    })
+}
+
+fn remap_predicates_through_project(
+    predicates: &[Predicate],
+    column_name_map: &[(String, String)],
+) -> Result<Vec<Predicate>> {
+    let alias_to_source: HashMap<&str, &str> = column_name_map
         .iter()
-        .enumerate()
-        .filter(|(idx, _)| !placed[*idx])
-        .map(|(_, pred)| pred.predicate.clone())
+        .map(|(source, alias)| (alias.as_str(), source.as_str()))
         .collect();
 
-    if !residual_predicates.is_empty() {
-        current_op = Box::new(filter::FilterOperator::new(current_op, &residual_predicates)?);
-    }
+    let mut remapped = Vec::with_capacity(predicates.len());
+    for pred in predicates {
+        let left = alias_to_source
+            .get(pred.column_name.as_str())
+            .copied()
+            .unwrap_or(pred.column_name.as_str())
+            .to_string();
 
-    Ok(Some(current_op))
+        let value = match &pred.value {
+            ComparisionValue::Column(c) => ComparisionValue::Column(
+                alias_to_source
+                    .get(c.as_str())
+                    .copied()
+                    .unwrap_or(c.as_str())
+                    .to_string(),
+            ),
+            ComparisionValue::I32(v) => ComparisionValue::I32(*v),
+            ComparisionValue::I64(v) => ComparisionValue::I64(*v),
+            ComparisionValue::F32(v) => ComparisionValue::F32(*v),
+            ComparisionValue::F64(v) => ComparisionValue::F64(*v),
+            ComparisionValue::String(v) => ComparisionValue::String(v.clone()),
+        };
+
+        remapped.push(Predicate {
+            column_name: left,
+            operator: pred.operator.clone(),
+            value,
+        });
+    }
+    Ok(remapped)
 }
 
 fn flatten_cross_inputs<'a>(op: &'a QueryOp, out: &mut Vec<&'a QueryOp>) {
@@ -334,157 +629,809 @@ fn logical_schema(ctx: &DbContext, op: &QueryOp) -> Result<RowSchema> {
     }
 }
 
-fn classify_predicates(
+#[derive(Clone)]
+struct SpjLeaf<'a> {
+    original_pos: usize,
+    op: &'a QueryOp,
+    schema: RowSchema,
+}
+
+#[derive(Clone)]
+struct JoinPredicateInfo {
+    left_leaf: usize,
+    right_leaf: usize,
+    predicate: Predicate,
+    is_equi_column_join: bool,
+}
+
+struct PredicateClassification {
+    local_predicates: Vec<Vec<Predicate>>,
+    join_predicates: Vec<JoinPredicateInfo>,
+    residual_predicates: Vec<Predicate>,
+}
+
+fn classify_predicates<'a>(
+    leaves: &[SpjLeaf<'a>],
     predicates: &[Predicate],
-    column_owner: &HashMap<String, usize>,
-) -> Option<Vec<ClassifiedPredicate>> {
-    let mut out = Vec::with_capacity(predicates.len());
+) -> Result<Option<PredicateClassification>> {
+    let mut local_predicates = vec![Vec::new(); leaves.len()];
+    let mut join_predicates = Vec::new();
+    let mut residual_predicates = Vec::new();
 
     for pred in predicates {
-        let mut mask = 0u64;
+        // Count how many leaves own the left-hand column.
+        let left_owners = count_column_owners(&pred.column_name, leaves);
+        match left_owners {
+            0 => {
+                // Column is not present in any leaf — we cannot safely
+                // classify this predicate.  Fall back to the simpler plan.
+                return Ok(None);
+            }
+            1 => {
+                let left_owner = unique_column_owner(&pred.column_name, leaves)
+                    .expect("count was 1 so owner must exist");
 
-        let left_owner = *column_owner.get(&pred.column_name)?;
-        mask |= 1u64 << left_owner;
-
-        if let ComparisionValue::Column(other_col) = &pred.value {
-            let right_owner = *column_owner.get(other_col)?;
-            mask |= 1u64 << right_owner;
+                match &pred.value {
+                    ComparisionValue::Column(other_col) => {
+                        let right_owners = count_column_owners(other_col, leaves);
+                        match right_owners {
+                            0 => return Ok(None),
+                            1 => {
+                                let right_owner =
+                                    unique_column_owner(other_col, leaves)
+                                        .expect("count was 1");
+                                if left_owner == right_owner {
+                                    local_predicates[left_owner].push(pred.clone());
+                                } else {
+                                    let (left_leaf, right_leaf) =
+                                        if left_owner < right_owner {
+                                            (left_owner, right_owner)
+                                        } else {
+                                            (right_owner, left_owner)
+                                        };
+                                    join_predicates.push(JoinPredicateInfo {
+                                        left_leaf,
+                                        right_leaf,
+                                        predicate: pred.clone(),
+                                        is_equi_column_join: matches!(
+                                            pred.operator,
+                                            ComparisionOperator::EQ
+                                        ),
+                                    });
+                                }
+                            }
+                            // Right column is ambiguous — can't push into
+                            // either leaf; evaluate after all joins instead.
+                            _ => residual_predicates.push(pred.clone()),
+                        }
+                    }
+                    _ => local_predicates[left_owner].push(pred.clone()),
+                }
+            }
+            // Left column is ambiguous — evaluate after all joins.
+            _ => residual_predicates.push(pred.clone()),
         }
+    }
 
-        out.push(ClassifiedPredicate {
-            predicate: pred.clone(),
-            relation_mask: mask,
+    Ok(Some(PredicateClassification {
+        local_predicates,
+        join_predicates,
+        residual_predicates,
+    }))
+}
+
+/// Returns how many leaves contain `column_name` in their schema.
+fn count_column_owners<'a>(column_name: &str, leaves: &[SpjLeaf<'a>]) -> usize {
+    leaves.iter().filter(|l| l.schema.contains(column_name)).count()
+}
+
+fn unique_column_owner<'a>(column_name: &str, leaves: &[SpjLeaf<'a>]) -> Option<usize> {
+    let mut owner = None;
+    for (idx, leaf) in leaves.iter().enumerate() {
+        if leaf.schema.contains(column_name) {
+            if owner.is_some() {
+                return None;
+            }
+            owner = Some(idx);
+        }
+    }
+    owner
+}
+
+fn compute_needed_by_leaf<'a>(
+    needed_above: Option<&HashSet<String>>,
+    leaves: &[SpjLeaf<'a>],
+    join_predicates: &[JoinPredicateInfo],
+    residual_predicates: &[Predicate],
+) -> Option<Vec<HashSet<String>>> {
+    let mut needed_sets = if let Some(needed) = needed_above {
+        let mut per_leaf = vec![HashSet::new(); leaves.len()];
+        for col in needed {
+            for (leaf_idx, leaf) in leaves.iter().enumerate() {
+                if leaf.schema.contains(col) {
+                    per_leaf[leaf_idx].insert(col.clone());
+                }
+            }
+        }
+        per_leaf
+    } else {
+        return None;
+    };
+
+    for info in join_predicates {
+        add_predicate_to_leaf_set(&mut needed_sets[info.left_leaf], &info.predicate, &leaves[info.left_leaf].schema);
+        add_predicate_to_leaf_set(&mut needed_sets[info.right_leaf], &info.predicate, &leaves[info.right_leaf].schema);
+    }
+    for pred in residual_predicates {
+        for (leaf_idx, leaf) in leaves.iter().enumerate() {
+            add_predicate_to_leaf_set(&mut needed_sets[leaf_idx], pred, &leaf.schema);
+        }
+    }
+
+    Some(needed_sets)
+}
+
+fn add_predicate_to_leaf_set(needed: &mut HashSet<String>, pred: &Predicate, schema: &RowSchema) {
+    if schema.contains(&pred.column_name) {
+        needed.insert(pred.column_name.clone());
+    }
+    if let ComparisionValue::Column(c) = &pred.value {
+        if schema.contains(c) {
+            needed.insert(c.clone());
+        }
+    }
+}
+
+fn collect_join_preds_for_step(
+    join_predicates: &[JoinPredicateInfo],
+    current_subset: &[usize],
+    new_leaf: usize,
+) -> Vec<Predicate> {
+    let current: HashSet<usize> = current_subset.iter().copied().collect();
+    let mut preds = Vec::new();
+    for info in join_predicates {
+        let touches_new = info.left_leaf == new_leaf || info.right_leaf == new_leaf;
+        let other = if info.left_leaf == new_leaf {
+            info.right_leaf
+        } else if info.right_leaf == new_leaf {
+            info.left_leaf
+        } else {
+            continue;
+        };
+        if touches_new && current.contains(&other) {
+            preds.push(info.predicate.clone());
+        }
+    }
+    preds
+}
+
+fn compute_needed_columns_for_subset<'a>(
+    subset_mask: usize,
+    leaves: &[SpjLeaf<'a>],
+    join_predicates: &[JoinPredicateInfo],
+    residual_predicates: &[Predicate],
+    final_needed: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    let mut needed = HashSet::new();
+
+    if let Some(final_needed) = final_needed {
+        for col in final_needed {
+            if subset_contains_column(subset_mask, leaves, col) {
+                needed.insert(col.clone());
+            }
+        }
+    } else {
+        for (leaf_idx, leaf) in leaves.iter().enumerate() {
+            if (subset_mask & (1usize << leaf_idx)) == 0 {
+                continue;
+            }
+            for col in leaf.schema.column_names() {
+                needed.insert(col.clone());
+            }
+        }
+    }
+
+    for info in join_predicates {
+        let left_in = (subset_mask & (1usize << info.left_leaf)) != 0;
+        let right_in = (subset_mask & (1usize << info.right_leaf)) != 0;
+
+        if left_in ^ right_in {
+            needed.insert(info.predicate.column_name.clone());
+            if let ComparisionValue::Column(c) = &info.predicate.value {
+                needed.insert(c.clone());
+            }
+        }
+    }
+
+    for pred in residual_predicates {
+        if subset_contains_column(subset_mask, leaves, &pred.column_name) {
+            needed.insert(pred.column_name.clone());
+        }
+        if let ComparisionValue::Column(c) = &pred.value {
+            if subset_contains_column(subset_mask, leaves, c) {
+                needed.insert(c.clone());
+            }
+        }
+    }
+
+    needed
+}
+
+fn subset_contains_column<'a>(subset_mask: usize, leaves: &[SpjLeaf<'a>], column_name: &str) -> bool {
+    for (leaf_idx, leaf) in leaves.iter().enumerate() {
+        if (subset_mask & (1usize << leaf_idx)) != 0 && leaf.schema.contains(column_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn trim_plan_to_needed<'a>(
+    plan: Box<dyn Operator + 'a>,
+    needed: &HashSet<String>,
+) -> Result<Box<dyn Operator + 'a>> {
+    let schema = plan.schema().clone();
+    if needed.is_empty() || needed.len() >= schema.len() {
+        return Ok(plan);
+    }
+
+    let column_name_map: Vec<(String, String)> = schema
+        .column_names()
+        .iter()
+        .filter(|col| needed.contains(col.as_str()))
+        .map(|col| (col.clone(), col.clone()))
+        .collect();
+
+    if column_name_map.is_empty() || column_name_map.len() == schema.len() {
+        Ok(plan)
+    } else {
+        Ok(Box::new(project::ProjectOperator::new(plan, &column_name_map)?))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlanStats {
+    rows: f64,
+    width_bytes: f64,
+    pages: f64,
+    cost: f64,
+}
+
+#[derive(Clone)]
+struct DpPlan {
+    order: Vec<usize>,
+    stats: PlanStats,
+}
+
+fn choose_left_deep_dp_order<'a>(
+    leaves: &[SpjLeaf<'a>],
+    local_predicates: &[Vec<Predicate>],
+    join_predicates: &[JoinPredicateInfo],
+    residual_predicates: &[Predicate],
+    final_needed: Option<&HashSet<String>>,
+    needed_by_leaf: Option<&Vec<HashSet<String>>>,
+    stats_catalog: &StatsCatalog,
+) -> Option<Vec<usize>> {
+    let n = leaves.len();
+    if n == 0 || n > 20 {
+        return None;
+    }
+
+    let full_mask = (1usize << n) - 1;
+    let mut dp: Vec<Option<DpPlan>> = vec![None; 1usize << n];
+    let leaf_stats: Vec<PlanStats> = (0..n)
+        .map(|leaf_idx| {
+            let subset_width_bytes = estimate_subset_width_bytes(
+                1usize << leaf_idx,
+                leaves,
+                join_predicates,
+                residual_predicates,
+                final_needed,
+            );
+            estimate_leaf_access_stats(
+                leaves,
+                local_predicates,
+                needed_by_leaf,
+                leaf_idx,
+                subset_width_bytes,
+                stats_catalog,
+            )
+        })
+        .collect();
+
+    for leaf_idx in 0..n {
+        let mask = 1usize << leaf_idx;
+        dp[mask] = Some(DpPlan {
+            order: vec![leaf_idx],
+            stats: leaf_stats[leaf_idx],
         });
     }
 
-    Some(out)
-}
-
-fn add_predicate_columns_to_leaf_sets(
-    leaf_needed: &mut [HashSet<String>],
-    column_owner: &HashMap<String, usize>,
-    pred: &Predicate,
-) -> Result<()> {
-    let left_owner = *column_owner
-        .get(&pred.column_name)
-        .expect("predicate column must have been classified");
-    leaf_needed[left_owner].insert(pred.column_name.clone());
-
-    if let ComparisionValue::Column(other_col) = &pred.value {
-        let right_owner = *column_owner
-            .get(other_col)
-            .expect("predicate column must have been classified");
-        leaf_needed[right_owner].insert(other_col.clone());
-    }
-
-    Ok(())
-}
-
-fn group_local_predicates(
-    classified: &[ClassifiedPredicate],
-    num_relations: usize,
-) -> Vec<Vec<Predicate>> {
-    let mut grouped = vec![Vec::new(); num_relations];
-
-    for pred in classified {
-        if pred.relation_mask.count_ones() == 1 {
-            let rel_idx = pred.relation_mask.trailing_zeros() as usize;
-            grouped[rel_idx].push(pred.predicate.clone());
+    for mask in 1usize..=full_mask {
+        let prev_plan = match dp[mask].clone() {
+            Some(plan) => plan,
+            None => continue,
+        };
+        if mask == full_mask {
+            continue;
         }
-    }
 
-    grouped
-}
-
-/// Choose a connected left-deep order using only lightweight heuristics.
-///
-/// This is intentionally not the full DP optimizer yet. The goal here is just
-/// to stop following the syntactic cross-product order blindly once we have
-/// already flattened the Filter(Cross(...)) block into relations + predicates.
-fn choose_greedy_connected_order(
-    leaves: &[FlattenedLeaf<'_>],
-    classified: &[ClassifiedPredicate],
-) -> Vec<usize> {
-    let num_relations = leaves.len();
-    let mut local_pred_count = vec![0usize; num_relations];
-    let mut edge_count = vec![vec![0usize; num_relations]; num_relations];
-
-    for pred in classified {
-        match pred.relation_mask.count_ones() {
-            1 => {
-                let rel_idx = pred.relation_mask.trailing_zeros() as usize;
-                local_pred_count[rel_idx] += 1;
-            }
-            2 => {
-                let a = pred.relation_mask.trailing_zeros() as usize;
-                let b_mask = pred.relation_mask & !(1u64 << a);
-                let b = b_mask.trailing_zeros() as usize;
-                edge_count[a][b] += 1;
-                edge_count[b][a] += 1;
-            }
-            _ => {}
-        }
-    }
-
-    let mut remaining: Vec<usize> = (0..num_relations).collect();
-    remaining.sort_by_key(|&idx| {
-        // More local predicates first; ties keep earlier relation order.
-        (usize::MAX - local_pred_count[idx], idx)
-    });
-
-    let start = remaining[0];
-    let mut order = vec![start];
-    let mut current_mask = 1u64 << start;
-    let mut used = vec![false; num_relations];
-    used[start] = true;
-
-    while order.len() < num_relations {
-        let mut best_idx = None;
-        let mut best_connected_edges = 0usize;
-        let mut best_local_preds = 0usize;
-
-        for candidate in 0..num_relations {
-            if used[candidate] {
+        for next_leaf in 0..n {
+            if (mask & (1usize << next_leaf)) != 0 {
                 continue;
             }
 
-            let mut connected_edges = 0usize;
-            for existing in 0..num_relations {
-                if (current_mask & (1u64 << existing)) != 0 {
-                    connected_edges += edge_count[candidate][existing];
-                }
+            let step_preds = step_join_predicates(mask, next_leaf, join_predicates);
+            if step_preds.is_empty() {
+                continue;
             }
 
-            if connected_edges > 0 {
-                let local = local_pred_count[candidate];
-                if best_idx.is_none()
-                    || connected_edges > best_connected_edges
-                    || (connected_edges == best_connected_edges && local > best_local_preds)
-                {
-                    best_idx = Some(candidate);
-                    best_connected_edges = connected_edges;
-                    best_local_preds = local;
-                }
+            let next_mask = mask | (1usize << next_leaf);
+            let mut next_order = prev_plan.order.clone();
+            next_order.push(next_leaf);
+            let subset_width_bytes = estimate_subset_width_bytes(
+                next_mask,
+                leaves,
+                join_predicates,
+                residual_predicates,
+                final_needed,
+            );
+            let next_stats = estimate_join_step(
+                prev_plan.stats,
+                leaf_stats[next_leaf],
+                &step_preds,
+                leaves,
+                stats_catalog,
+                subset_width_bytes,
+                leaves[next_leaf].original_pos,
+            );
+
+            let should_replace = match &dp[next_mask] {
+                None => true,
+                Some(existing) => better_plan(next_stats, existing.stats),
+            };
+
+            if should_replace {
+                dp[next_mask] = Some(DpPlan {
+                    order: next_order,
+                    stats: next_stats,
+                });
             }
         }
-
-        let chosen = if let Some(idx) = best_idx {
-            idx
-        } else {
-            // Disconnected fallback: preserve original order among the remaining leaves.
-            (0..num_relations).find(|&idx| !used[idx]).unwrap()
-        };
-
-        used[chosen] = true;
-        current_mask |= 1u64 << chosen;
-        order.push(chosen);
     }
 
-    order
+    dp[full_mask].as_ref().map(|plan| plan.order.clone())
 }
 
-/// If `needed` is `Some`, extend it with columns referenced in the predicates.
-/// If `needed` is `None` (no pruning), return `None` (still no pruning).
+fn better_plan(new_stats: PlanStats, old_stats: PlanStats) -> bool {
+    const EPS: f64 = 1e-9;
+    if new_stats.cost + EPS < old_stats.cost {
+        return true;
+    }
+    if old_stats.cost + EPS < new_stats.cost {
+        return false;
+    }
+
+    if new_stats.pages + EPS < old_stats.pages {
+        return true;
+    }
+    if old_stats.pages + EPS < new_stats.pages {
+        return false;
+    }
+
+    if new_stats.rows + EPS < old_stats.rows {
+        return true;
+    }
+    false
+}
+
+fn estimate_leaf_access_stats<'a>(
+    leaves: &[SpjLeaf<'a>],
+    local_predicates: &[Vec<Predicate>],
+    needed_by_leaf: Option<&Vec<HashSet<String>>>,
+    leaf_idx: usize,
+    subset_width_bytes: f64,
+    stats_catalog: &StatsCatalog,
+) -> PlanStats {
+    let width_bytes = subset_width_bytes;
+    let base_rows = estimate_base_rows_for_leaf(leaves[leaf_idx].op, stats_catalog).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let selectivity = estimate_local_selectivity_for_leaf(leaves[leaf_idx].op, &local_predicates[leaf_idx], stats_catalog);
+    let rows = (base_rows * selectivity).max(1.0);
+
+    // If a range predicate targets a physically-ordered column we can skip
+    // blocks that fall outside the predicate range.  Model this by scaling the
+    // page estimate by the fraction of blocks we actually need to read (the
+    // range selectivity).  This gives the join-order optimizer a realistic
+    // picture of how cheap such a scan really is.
+    let scan_fraction = ordered_scan_fraction(
+        leaves[leaf_idx].op,
+        &local_predicates[leaf_idx],
+        stats_catalog,
+    );
+    let pages = (estimate_pages(rows, width_bytes) * scan_fraction).max(1.0);
+
+    let _ = (leaves, needed_by_leaf); // width already comes from subset_width_bytes.
+
+    PlanStats {
+        rows,
+        width_bytes,
+        pages,
+        cost: pages,
+    }
+}
+
+/// Returns the fraction of blocks that must be read when one or more range
+/// predicates target a physically-ordered column.  Returns 1.0 (full scan)
+/// when no such predicate exists.
+///
+/// When `IsPhysicallyOrdered` is true the data is stored sorted on that
+/// column, so a range predicate `col > X` only needs to touch the tail of the
+/// file rather than every block.  We use the range selectivity (derived from
+/// `RangeStat`) as a proxy for this fraction.  The minimum over all ordered
+/// range predicates is used when several such predicates are present.
+fn ordered_scan_fraction(
+    op: &QueryOp,
+    predicates: &[Predicate],
+    stats_catalog: &StatsCatalog,
+) -> f64 {
+    let table_id = match leaf_base_table_id(op) {
+        Some(id) => id,
+        None => return 1.0,
+    };
+
+    let mut best: f64 = 1.0;
+    for pred in predicates {
+        let col_stats = match stats_catalog.column(table_id, &pred.column_name) {
+            Some(s) => s,
+            None => continue,
+        };
+        if col_stats.is_physically_ordered != Some(true) {
+            continue;
+        }
+        let is_range = matches!(
+            pred.operator,
+            ComparisionOperator::GT
+                | ComparisionOperator::GTE
+                | ComparisionOperator::LT
+                | ComparisionOperator::LTE
+        );
+        if !is_range {
+            continue;
+        }
+        let frac = estimate_range_selectivity(Some(col_stats), pred)
+            .unwrap_or(RANGE_PRED_SELECTIVITY);
+        if frac < best {
+            best = frac;
+        }
+    }
+    best
+}
+
+fn estimate_subset_width_bytes<'a>(
+    subset_mask: usize,
+    leaves: &[SpjLeaf<'a>],
+    join_predicates: &[JoinPredicateInfo],
+    residual_predicates: &[Predicate],
+    final_needed: Option<&HashSet<String>>,
+) -> f64 {
+    let keep_cols = compute_needed_columns_for_subset(
+        subset_mask,
+        leaves,
+        join_predicates,
+        residual_predicates,
+        final_needed,
+    );
+    let width_cols = keep_cols.len().max(1);
+    estimate_width_bytes(width_cols)
+}
+
+fn estimate_join_step<'a>(
+    left: PlanStats,
+    right: PlanStats,
+    step_preds: &[&JoinPredicateInfo],
+    leaves: &[SpjLeaf<'a>],
+    stats_catalog: &StatsCatalog,
+    output_width: f64,
+    right_original_pos: usize,
+) -> PlanStats {
+    let output_rows = estimate_join_rows(left.rows, right.rows, step_preds, leaves, stats_catalog);
+    let output_pages = estimate_pages(output_rows, output_width).max(1.0);
+
+    let has_equi = step_preds.iter().any(|pred| pred.is_equi_column_join);
+    let join_work = if has_equi {
+        left.pages + right.pages + output_pages
+    } else {
+        left.pages + (left.pages * right.pages) + output_pages
+    };
+
+    let _ = right_original_pos; // unused after tie_break removal
+
+    PlanStats {
+        rows: output_rows,
+        width_bytes: output_width,
+        pages: output_pages,
+        cost: left.cost + right.cost + join_work,
+    }
+}
+
+fn estimate_base_rows_for_leaf(op: &QueryOp, stats_catalog: &StatsCatalog) -> Option<f64> {
+    let table_id = leaf_base_table_id(op)?;
+    stats_catalog.row_count(table_id)
+}
+
+fn leaf_base_table_id<'a>(op: &'a QueryOp) -> Option<&'a str> {
+    match op {
+        QueryOp::Scan(scan_data) => Some(scan_data.table_id.as_str()),
+        QueryOp::Filter(filter_data) => leaf_base_table_id(&filter_data.underlying),
+        QueryOp::Sort(sort_data) => leaf_base_table_id(&sort_data.underlying),
+        QueryOp::Project(project_data) => leaf_base_table_id(&project_data.underlying),
+        QueryOp::Cross(_) => None,
+    }
+}
+
+fn estimate_local_selectivity_for_leaf(
+    op: &QueryOp,
+    extra_predicates: &[Predicate],
+    stats_catalog: &StatsCatalog,
+) -> f64 {
+    if let Some((table_id, predicates)) = extract_scan_and_source_predicates(op, extra_predicates.to_vec()) {
+        estimate_local_selectivity_on_table(stats_catalog, &table_id, &predicates)
+    } else {
+        estimate_local_selectivity(extra_predicates)
+    }
+}
+
+fn extract_scan_and_source_predicates(op: &QueryOp, mut predicates: Vec<Predicate>) -> Option<(String, Vec<Predicate>)> {
+    match op {
+        QueryOp::Scan(scan_data) => Some((scan_data.table_id.clone(), predicates)),
+        QueryOp::Filter(filter_data) => {
+            predicates.extend(filter_data.predicates.clone());
+            extract_scan_and_source_predicates(&filter_data.underlying, predicates)
+        }
+        QueryOp::Sort(sort_data) => extract_scan_and_source_predicates(&sort_data.underlying, predicates),
+        QueryOp::Project(project_data) => {
+            let remapped = remap_predicates_through_project(&predicates, &project_data.column_name_map).ok()?;
+            extract_scan_and_source_predicates(&project_data.underlying, remapped)
+        }
+        QueryOp::Cross(_) => None,
+    }
+}
+
+fn estimate_local_selectivity_on_table(
+    stats_catalog: &StatsCatalog,
+    table_id: &str,
+    predicates: &[Predicate],
+) -> f64 {
+    let mut sel: f64 = 1.0;
+    for pred in predicates {
+        sel *= estimate_predicate_selectivity(stats_catalog, table_id, pred);
+    }
+    sel.clamp(MIN_SELECTIVITY, 1.0_f64)
+}
+
+fn estimate_predicate_selectivity(
+    stats_catalog: &StatsCatalog,
+    table_id: &str,
+    pred: &Predicate,
+) -> f64 {
+    match &pred.value {
+        ComparisionValue::Column(_) => estimate_local_selectivity(std::slice::from_ref(pred)),
+        _ => {
+            let row_count = stats_catalog.row_count(table_id).unwrap_or(DEFAULT_BASE_REL_ROWS);
+            let col_stats = stats_catalog.column(table_id, &pred.column_name);
+            match pred.operator {
+                ComparisionOperator::EQ => estimate_eq_literal_selectivity(col_stats, row_count),
+                ComparisionOperator::NE => (1.0 - estimate_eq_literal_selectivity(col_stats, row_count))
+                    .clamp(MIN_SELECTIVITY, 1.0_f64),
+                ComparisionOperator::GT
+                | ComparisionOperator::GTE
+                | ComparisionOperator::LT
+                | ComparisionOperator::LTE => estimate_range_selectivity(col_stats, pred)
+                    .unwrap_or(RANGE_PRED_SELECTIVITY),
+            }
+        }
+    }
+}
+
+fn estimate_eq_literal_selectivity(col_stats: Option<&ColumnStats>, row_count: f64) -> f64 {
+    if let Some(stats) = col_stats {
+        if let Some(density) = stats.density {
+            // DensityStat = fraction of rows with a unique value, so
+            // NDV = row_count * density.
+            let ndv = (row_count * density).max(1.0);
+            return (1.0 / ndv).clamp(MIN_SELECTIVITY, 1.0_f64);
+        }
+    }
+    // No DensityStat available.  The flat 10% default is far too high for any
+    // large table (e.g. TPC-H lineitem has ~6M rows; 10% = 600k matches for an
+    // equality predicate, which is absurd).  Use sqrt(row_count) as a rough NDV
+    // estimate — this gives ~1/2449 for lineitem, orders of magnitude more
+    // realistic and produces much better join-order decisions.
+    let ndv = row_count.sqrt().max(1.0);
+    (1.0 / ndv).clamp(MIN_SELECTIVITY, 1.0_f64)
+}
+
+fn estimate_range_selectivity(col_stats: Option<&ColumnStats>, pred: &Predicate) -> Option<f64> {
+    let stats = col_stats?;
+    match (
+        stats.numeric_range,
+        stats.string_range.as_ref(),
+        comparison_value_to_scalar(&pred.value),
+    ) {
+        (Some((lo, hi)), _, Some(ScalarValue::Number(v))) => {
+            let span = (hi - lo).abs();
+            if span <= f64::EPSILON {
+                return Some(EQ_PRED_SELECTIVITY);
+            }
+            let frac = match pred.operator {
+                ComparisionOperator::LT | ComparisionOperator::LTE => ((v - lo) / span).clamp(0.0, 1.0),
+                ComparisionOperator::GT | ComparisionOperator::GTE => ((hi - v) / span).clamp(0.0, 1.0),
+                _ => return None,
+            };
+            Some(frac.clamp(MIN_SELECTIVITY, 1.0_f64))
+        }
+        (_, Some((lo, hi)), Some(ScalarValue::Text(v))) => {
+            if lo == hi {
+                return Some(EQ_PRED_SELECTIVITY);
+            }
+            let frac: f64 = match pred.operator {
+                ComparisionOperator::LT | ComparisionOperator::LTE => {
+                    if &v <= lo {
+                        0.0_f64
+                    } else if &v >= hi {
+                        1.0_f64
+                    } else {
+                        0.5_f64
+                    }
+                }
+                ComparisionOperator::GT | ComparisionOperator::GTE => {
+                    if &v <= lo {
+                        1.0_f64
+                    } else if &v >= hi {
+                        0.0_f64
+                    } else {
+                        0.5_f64
+                    }
+                }
+                _ => return None,
+            };
+            Some(frac.clamp(MIN_SELECTIVITY, 1.0_f64))
+        }
+        _ => None,
+    }
+}
+
+fn comparison_value_to_scalar(value: &ComparisionValue) -> Option<ScalarValue> {
+    match value {
+        ComparisionValue::I32(v) => Some(ScalarValue::Number(*v as f64)),
+        ComparisionValue::I64(v) => Some(ScalarValue::Number(*v as f64)),
+        ComparisionValue::F32(v) => Some(ScalarValue::Number(*v as f64)),
+        ComparisionValue::F64(v) => Some(ScalarValue::Number(*v)),
+        ComparisionValue::String(v) => Some(ScalarValue::Text(v.clone())),
+        ComparisionValue::Column(_) => None,
+    }
+}
+
+fn estimate_local_selectivity(predicates: &[Predicate]) -> f64 {
+    let mut sel: f64 = 1.0;
+
+    for pred in predicates {
+        sel *= match pred.operator {
+            ComparisionOperator::EQ => EQ_PRED_SELECTIVITY,
+            ComparisionOperator::NE => NE_PRED_SELECTIVITY,
+            ComparisionOperator::GT
+            | ComparisionOperator::GTE
+            | ComparisionOperator::LT
+            | ComparisionOperator::LTE => RANGE_PRED_SELECTIVITY,
+        };
+    }
+
+    sel.clamp(MIN_SELECTIVITY, 1.0_f64)
+}
+
+fn step_join_predicates<'a>(
+    subset_mask: usize,
+    next_leaf: usize,
+    join_predicates: &'a [JoinPredicateInfo],
+) -> Vec<&'a JoinPredicateInfo> {
+    let mut preds = Vec::new();
+    for info in join_predicates {
+        let touches_next = info.left_leaf == next_leaf || info.right_leaf == next_leaf;
+        if !touches_next {
+            continue;
+        }
+        let other = if info.left_leaf == next_leaf {
+            info.right_leaf
+        } else {
+            info.left_leaf
+        };
+        if (subset_mask & (1usize << other)) != 0 {
+            preds.push(info);
+        }
+    }
+    preds
+}
+
+fn estimate_join_rows<'a>(
+    left_rows: f64,
+    right_rows: f64,
+    step_preds: &[&JoinPredicateInfo],
+    leaves: &[SpjLeaf<'a>],
+    stats_catalog: &StatsCatalog,
+) -> f64 {
+    let mut sel: f64 = 1.0;
+
+    for pred in step_preds {
+        if pred.is_equi_column_join {
+            sel *= estimate_equi_join_selectivity(pred, leaves, stats_catalog)
+                .unwrap_or(EQ_JOIN_SELECTIVITY);
+        } else {
+            sel *= OTHER_JOIN_SELECTIVITY;
+        }
+    }
+
+    (left_rows * right_rows * sel).max(1.0_f64)
+}
+
+fn estimate_equi_join_selectivity<'a>(
+    info: &JoinPredicateInfo,
+    leaves: &[SpjLeaf<'a>],
+    stats_catalog: &StatsCatalog,
+) -> Option<f64> {
+    let left_col = resolve_column_in_leaf(leaves[info.left_leaf].op, &info.predicate.column_name)?;
+    let right_name = match &info.predicate.value {
+        ComparisionValue::Column(c) => c.as_str(),
+        _ => return None,
+    };
+    let right_col = resolve_column_in_leaf(leaves[info.right_leaf].op, right_name)?;
+
+    let left_rows = stats_catalog.row_count(&left_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let right_rows = stats_catalog.row_count(&right_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let left_density = stats_catalog.column(&left_col.0, &left_col.1)?.density?;
+    let right_density = stats_catalog.column(&right_col.0, &right_col.1)?.density?;
+
+    let left_ndv = (left_rows * left_density).max(1.0);
+    let right_ndv = (right_rows * right_density).max(1.0);
+    Some((1.0 / left_ndv.max(right_ndv)).clamp(MIN_SELECTIVITY, 1.0_f64))
+}
+
+fn resolve_column_in_leaf(op: &QueryOp, column_name: &str) -> Option<(String, String)> {
+    match op {
+        QueryOp::Scan(scan_data) => Some((scan_data.table_id.clone(), column_name.to_string())),
+        QueryOp::Filter(filter_data) => resolve_column_in_leaf(&filter_data.underlying, column_name),
+        QueryOp::Sort(sort_data) => resolve_column_in_leaf(&sort_data.underlying, column_name),
+        QueryOp::Project(project_data) => {
+            let source = project_data
+                .column_name_map
+                .iter()
+                .find(|(_, alias)| alias == column_name)
+                .map(|(source, _)| source.as_str())
+                .unwrap_or(column_name);
+            resolve_column_in_leaf(&project_data.underlying, source)
+        }
+        QueryOp::Cross(_) => None,
+    }
+}
+
+fn estimate_width_bytes(width_cols: usize) -> f64 {
+    ROW_OVERHEAD_BYTES + AVG_COL_WIDTH_BYTES * width_cols as f64
+}
+
+fn estimate_pages(rows: f64, width_bytes: f64) -> f64 {
+    (rows * width_bytes / DEFAULT_BLOCK_BYTES).ceil().max(1.0)
+}
+
+const DEFAULT_BASE_REL_ROWS: f64 = 10_000.0;
+const AVG_COL_WIDTH_BYTES: f64 = 24.0;
+const ROW_OVERHEAD_BYTES: f64 = 8.0;
+const DEFAULT_BLOCK_BYTES: f64 = 4096.0;
+const MIN_SELECTIVITY: f64 = 0.0001;
+const EQ_PRED_SELECTIVITY: f64 = 0.10;
+const NE_PRED_SELECTIVITY: f64 = 0.90;
+const RANGE_PRED_SELECTIVITY: f64 = 0.33;
+const EQ_JOIN_SELECTIVITY: f64 = 0.001;
+const OTHER_JOIN_SELECTIVITY: f64 = 0.10;
+
 fn add_predicate_columns(
     needed: Option<&HashSet<String>>,
     predicates: &[Predicate],
@@ -501,7 +1448,6 @@ fn add_predicate_columns(
     })
 }
 
-/// If `needed` is `Some`, extend it with sort-key columns.
 fn add_sort_columns(
     needed: Option<&HashSet<String>>,
     sort_specs: &[SortSpec],

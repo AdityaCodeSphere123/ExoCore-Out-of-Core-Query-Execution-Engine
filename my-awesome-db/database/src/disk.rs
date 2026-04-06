@@ -64,8 +64,13 @@ impl ScanOperator {
     }
 
     fn refill_prefetch_buffer(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<bool> {
+        // Single lookup per call: ctx.db_ctx is &'a DbContext (Copy), so
+        // table_spec borrows from the DbContext directly rather than from ctx,
+        // letting us also access ctx.disk_reader / ctx.disk_writer below
+        // without a borrow conflict.
+        let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
+
         if self.start_block.is_none() {
-            let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
             self.start_block = Some(get_file_start_block(
                 ctx.disk_reader,
                 ctx.disk_writer,
@@ -84,8 +89,6 @@ impl ScanOperator {
         if self.current_block_offset >= num_blocks {
             return Ok(false);
         }
-
-        let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
         let remaining_blocks = (num_blocks - self.current_block_offset) as usize;
         let batch_blocks = remaining_blocks.min(SCAN_PREFETCH_BLOCKS);
         let block_size = ctx.buffer_manager.block_size();

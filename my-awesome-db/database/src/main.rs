@@ -29,6 +29,7 @@ fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
 
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
+    let stats_catalog = executor::StatsCatalog::from_config_path(cli_options.get_config_path())?;
 
     let (disk_in, mut disk_out) = setup_disk_io();
     let (monitor_in, mut monitor_out) = setup_monitor_io();
@@ -38,12 +39,10 @@ fn db_main() -> Result<()> {
 
     let mut input_line = String::new();
 
-    // Read query from monitor
     monitor_buf_reader.read_line(&mut input_line)?;
     let query: Query = serde_json::from_str(&input_line)?;
     eprintln!("Input query is: {:#?}", query);
 
-    // Ask monitor for memory limit
     input_line.clear();
     monitor_out.write_all(b"get_memory_limit\n")?;
     monitor_out.flush()?;
@@ -54,8 +53,6 @@ fn db_main() -> Result<()> {
 
     let memory_limit_bytes = (memory_limit_mb as usize) * 1024 * 1024;
 
-    // Keep the base-table read cache intentionally small. Sort needs the real
-    // working memory now, and scan/filter/project are already streaming.
     let capacity = 2;
     let mut buffer_manager = BufferManager::new(block_size, capacity)?;
 
@@ -72,6 +69,7 @@ fn db_main() -> Result<()> {
         &mut buffer_manager,
         &mut temp_storage,
         sort_run_bytes,
+        &stats_catalog,
     )?;
 
     Ok(())

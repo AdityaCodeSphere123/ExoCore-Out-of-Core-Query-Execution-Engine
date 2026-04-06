@@ -76,24 +76,18 @@ fn choose_writer_batch(sort_run_bytes: usize, block_size: usize, num_partitions:
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-/// Inspect predicates and build a Grace Hash Join when there is at least one
-/// equi-join condition (col_from_left = col_from_right).  Falls back to a
-/// nested-loop join otherwise.
-pub fn build_join<'a>(
-    left: Box<dyn Operator + 'a>,
-    right: Box<dyn Operator + 'a>,
+/// Classify predicates into equi-join keys and residual predicates.
+/// Returns (left_key_indices, right_key_indices, extra_predicates).
+fn split_join_predicates(
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
     predicates: &[Predicate],
-) -> Result<Box<dyn Operator + 'a>> {
-    let left_schema = left.schema().clone();
-    let right_schema = right.schema().clone();
-
+) -> (Vec<usize>, Vec<usize>, Vec<Predicate>) {
     let mut left_key_indices: Vec<usize> = Vec::new();
     let mut right_key_indices: Vec<usize> = Vec::new();
     let mut extra_predicates: Vec<Predicate> = Vec::new();
 
     for pred in predicates {
-        // An equi-join predicate is EQ where one operand is in the left
-        // schema and the other is in the right schema.
         if let (ComparisionOperator::EQ, ComparisionValue::Column(other_col)) =
             (&pred.operator, &pred.value)
         {
@@ -116,6 +110,45 @@ pub fn build_join<'a>(
         extra_predicates.push(pred.clone());
     }
 
+    (left_key_indices, right_key_indices, extra_predicates)
+}
+
+/// Build a join operator without row-count hints.  Picks Grace Hash Join for
+/// equi-join predicates; falls back to Block Nested Loop otherwise.
+pub fn build_join<'a>(
+    left: Box<dyn Operator + 'a>,
+    right: Box<dyn Operator + 'a>,
+    predicates: &[Predicate],
+) -> Result<Box<dyn Operator + 'a>> {
+    build_join_impl(left, right, predicates, None, None)
+}
+
+/// Same as `build_join` but accepts estimated row counts for both sides.
+/// Used by the SPJ planner which has per-leaf statistics available.  The hints
+/// are forwarded to `BlockNestedLoopJoinOperator` so it can choose which side
+/// to spill (inner) and which to batch in memory (outer).
+pub fn build_join_hinted<'a>(
+    left: Box<dyn Operator + 'a>,
+    right: Box<dyn Operator + 'a>,
+    predicates: &[Predicate],
+    left_rows_hint: f64,
+    right_rows_hint: f64,
+) -> Result<Box<dyn Operator + 'a>> {
+    build_join_impl(left, right, predicates, Some(left_rows_hint), Some(right_rows_hint))
+}
+
+fn build_join_impl<'a>(
+    left: Box<dyn Operator + 'a>,
+    right: Box<dyn Operator + 'a>,
+    predicates: &[Predicate],
+    left_rows_hint: Option<f64>,
+    right_rows_hint: Option<f64>,
+) -> Result<Box<dyn Operator + 'a>> {
+    let left_schema = left.schema().clone();
+    let right_schema = right.schema().clone();
+    let (left_key_indices, right_key_indices, extra_predicates) =
+        split_join_predicates(&left_schema, &right_schema, predicates);
+
     if !left_key_indices.is_empty() {
         Ok(Box::new(HashJoinOperator::new(
             left,
@@ -125,10 +158,12 @@ pub fn build_join<'a>(
             extra_predicates,
         )?))
     } else {
-        Ok(Box::new(CrossJoinOperator::new(
+        Ok(Box::new(BlockNestedLoopJoinOperator::new(
             left,
             right,
             extra_predicates,
+            left_rows_hint,
+            right_rows_hint,
         )?))
     }
 }
@@ -384,7 +419,14 @@ impl<'a> Operator for HashJoinOperator<'a> {
 
                     match probe_row {
                         None => {
-                            // This partition is done; advance.
+                            // This partition is done.  Delete both temp files
+                            // immediately so disk space is reclaimed before the
+                            // next partition is loaded, rather than holding all
+                            // partition files open until the operator is dropped.
+                            ctx.temp_storage
+                                .delete_temp_file(ps.left_parts[ps.current_part])?;
+                            ctx.temp_storage
+                                .delete_temp_file(ps.right_parts[ps.current_part])?;
                             ps.current_part += 1;
                             ps.probe_reader = None;
                             ps.build_map.clear();
@@ -420,135 +462,210 @@ impl<'a> Operator for HashJoinOperator<'a> {
     }
 }
 
-// ── Cross / Nested-Loop Join (fallback for non-equi conditions) ───────────────
+// ── Block Nested-Loop Join (fallback for non-equi conditions) ───────────────
 
-/// Out-of-core nested loop join used when no equi-join predicate exists.
-///
-/// Strategy:
-///   1. On first call, spill **all left rows** to a temp file.
-///   2. For each right row, replay the left temp file and emit merged rows
-///      that satisfy all predicates.
-///
-/// Memory: 2 × block_size (one reader page buffer per side) + one row.
-pub struct CrossJoinOperator<'a> {
-    left: Option<Box<dyn Operator + 'a>>,
-    right: Option<Box<dyn Operator + 'a>>,
-    resolved: Vec<ResolvedPredicate>,
-    merged_schema: RowSchema,
-    state: CrossState,
+const MAX_BNLJ_OUTER_BATCH_PAGES: usize = 64;
+
+fn choose_bnlj_outer_batch_bytes(ctx: &ExecContext) -> usize {
+    let block_size = ctx.temp_storage.block_size().max(1);
+    let total_pages = (ctx.sort_run_bytes / block_size).max(1);
+    let batch_pages = (total_pages / 8).max(1).min(MAX_BNLJ_OUTER_BATCH_PAGES);
+    batch_pages * block_size
 }
 
-enum CrossState {
+/// Out-of-core block nested loop join used when no equi-join predicate exists.
+///
+/// Strategy:
+///   1. Identify the "inner" side (smaller, spilled once to temp storage) and
+///      the "outer" side (larger, read in memory-sized batches).  When row-count
+///      hints are provided, we spill whichever side has fewer rows; otherwise we
+///      default to spilling left.  Spilling the smaller side minimises the
+///      number of disk pages read per outer batch.
+///   2. For each outer batch, re-scan the full inner file and evaluate
+///      predicates against every (inner, outer) pair.
+///
+/// Output column order is always [original_left | original_right] regardless
+/// of which side was chosen as inner.
+pub struct BlockNestedLoopJoinOperator<'a> {
+    /// Spilled side — scanned once per outer batch.
+    inner: Option<Box<dyn Operator + 'a>>,
+    /// Batched side — loaded into memory in chunks.
+    outer: Option<Box<dyn Operator + 'a>>,
+    /// True when the original *left* operand was chosen as inner.  Used to
+    /// restore [left | right] column order when merging rows.
+    inner_is_left: bool,
+    resolved: Vec<ResolvedPredicate>,
+    merged_schema: RowSchema,
+    state: BlockNestedLoopState,
+}
+
+enum BlockNestedLoopState {
     NotStarted,
-    Running {
-        left_file: TempFileId,
-        /// Current right row being matched against all left rows.
-        right_row: Row,
-        left_reader: TempRunReader,
+    NeedOuterBatch {
+        inner_file: TempFileId,
     },
-    /// Left file ready; need to fetch the next right row.
-    FetchRight {
-        left_file: TempFileId,
+    ScanningInner {
+        inner_file: TempFileId,
+        outer_batch: Vec<Row>,
+        inner_reader: TempRunReader,
+        output_buf: Vec<Row>,
     },
     Done,
 }
 
-impl<'a> CrossJoinOperator<'a> {
+impl<'a> BlockNestedLoopJoinOperator<'a> {
     fn new(
         left: Box<dyn Operator + 'a>,
         right: Box<dyn Operator + 'a>,
         predicates: Vec<Predicate>,
+        left_rows_hint: Option<f64>,
+        right_rows_hint: Option<f64>,
     ) -> Result<Self> {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
+        // merged_schema always preserves [left | right] column order so that
+        // resolved predicate indices and output row layout are stable.
         let merged_schema = RowSchema::merge(&left_schema, &right_schema);
         let resolved = resolve_predicates(&merged_schema, &predicates)?;
+
+        // Choose which side to spill.  Spilling the *smaller* side means we
+        // read fewer pages on each rescan, directly reducing disk I/O.
+        let inner_is_left = match (left_rows_hint, right_rows_hint) {
+            (Some(l), Some(r)) => l <= r, // left is smaller → left is inner
+            _ => true,                    // no hints → preserve original behaviour
+        };
+        let (inner, outer) = if inner_is_left {
+            (left, right)
+        } else {
+            (right, left)
+        };
+
         Ok(Self {
-            left: Some(left),
-            right: Some(right),
+            inner: Some(inner),
+            outer: Some(outer),
+            inner_is_left,
             resolved,
             merged_schema,
-            state: CrossState::NotStarted,
+            state: BlockNestedLoopState::NotStarted,
         })
     }
 
-    fn spill_left(&mut self, ctx: &mut ExecContext) -> Result<TempFileId> {
-        let mut writer = TempRunWriter::new(ctx.temp_storage)?;
-        let mut left = self.left.take().expect("left already consumed");
+    fn spill_inner(&mut self, ctx: &mut ExecContext) -> Result<TempFileId> {
+        // Use a larger write batch so the inner file lands in fewer extents,
+        // reducing seeks on each outer-batch rescan.  Cap at 64 pages so the
+        // pre-allocated write buffer fits comfortably in the memory budget.
+        let block_size = ctx.temp_storage.block_size().max(1);
+        let batch_pages = (ctx.sort_run_bytes / block_size).max(1).min(64);
+        let mut writer = TempRunWriter::with_batch_pages(ctx.temp_storage, batch_pages)?;
+        let mut inner = self.inner.take().expect("inner already consumed");
         loop {
-            let maybe = left.next(ctx)?;
-            let row = match maybe {
+            let row = match inner.next(ctx)? {
                 Some(r) => r,
                 None => break,
             };
-            writer.append_row(
-                &row,
-                ctx.temp_storage,
-                &mut *ctx.disk_reader,
-                &mut *ctx.disk_writer,
-            )?;
+            writer.append_row(&row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
         }
         writer.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)
     }
+
+    fn fill_outer_batch(&mut self, ctx: &mut ExecContext) -> Result<Vec<Row>> {
+        let target_bytes = choose_bnlj_outer_batch_bytes(ctx);
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        let outer = self.outer.as_mut().expect("outer already consumed");
+
+        loop {
+            let row = match outer.next(ctx)? {
+                Some(r) => r,
+                None => break,
+            };
+            bytes += row.estimate_heap_size();
+            batch.push(row);
+            if bytes >= target_bytes {
+                break;
+            }
+        }
+        Ok(batch)
+    }
 }
 
-impl<'a> Operator for CrossJoinOperator<'a> {
+impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
     fn schema(&self) -> &RowSchema {
         &self.merged_schema
     }
 
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
         loop {
-            match std::mem::replace(&mut self.state, CrossState::Done) {
-                CrossState::NotStarted => {
-                    let left_file = self.spill_left(ctx)?;
-                    self.state = CrossState::FetchRight { left_file };
+            match std::mem::replace(&mut self.state, BlockNestedLoopState::Done) {
+                BlockNestedLoopState::NotStarted => {
+                    let inner_file = self.spill_inner(ctx)?;
+                    self.state = BlockNestedLoopState::NeedOuterBatch { inner_file };
                 }
 
-                CrossState::Done => return Ok(None),
+                BlockNestedLoopState::Done => return Ok(None),
 
-                CrossState::FetchRight { left_file } => {
-                    let right = self.right.as_mut().expect("right already consumed");
-                    let maybe = right.next(ctx)?;
-                    match maybe {
-                        None => {
-                            return Ok(None);
-                        }
-                        Some(right_row) => {
-                            let left_reader = TempRunReader::new(ctx.temp_storage, left_file)?;
-                            self.state = CrossState::Running {
-                                left_file,
-                                right_row,
-                                left_reader,
-                            };
-                        }
+                BlockNestedLoopState::NeedOuterBatch { inner_file } => {
+                    let outer_batch = self.fill_outer_batch(ctx)?;
+                    if outer_batch.is_empty() {
+                        ctx.temp_storage.delete_temp_file(inner_file)?;
+                        self.state = BlockNestedLoopState::Done;
+                        return Ok(None);
                     }
+
+                    let inner_reader = TempRunReader::new(ctx.temp_storage, inner_file)?;
+                    self.state = BlockNestedLoopState::ScanningInner {
+                        inner_file,
+                        outer_batch,
+                        inner_reader,
+                        output_buf: Vec::new(),
+                    };
                 }
 
-                CrossState::Running {
-                    left_file,
-                    right_row,
-                    mut left_reader,
+                BlockNestedLoopState::ScanningInner {
+                    inner_file,
+                    outer_batch,
+                    mut inner_reader,
+                    mut output_buf,
                 } => {
-                    let maybe = left_reader.next_row(
+                    if let Some(row) = output_buf.pop() {
+                        self.state = BlockNestedLoopState::ScanningInner {
+                            inner_file,
+                            outer_batch,
+                            inner_reader,
+                            output_buf,
+                        };
+                        return Ok(Some(row));
+                    }
+
+                    let maybe_inner = inner_reader.next_row(
                         ctx.temp_storage,
                         &mut *ctx.disk_reader,
                         &mut *ctx.disk_writer,
                     )?;
-                    match maybe {
+
+                    match maybe_inner {
                         None => {
-                            self.state = CrossState::FetchRight { left_file };
+                            // Inner exhausted; get the next outer batch.
+                            self.state = BlockNestedLoopState::NeedOuterBatch { inner_file };
                         }
-                        Some(left_row) => {
-                            let merged = Row::merge(&left_row, &right_row);
-                            self.state = CrossState::Running {
-                                left_file,
-                                right_row,
-                                left_reader,
-                            };
-                            if eval_resolved(&merged, &self.resolved)? {
-                                return Ok(Some(merged));
+                        Some(inner_row) => {
+                            for outer_row in outer_batch.iter().rev() {
+                                // Restore [original_left | original_right] column order.
+                                let merged = if self.inner_is_left {
+                                    Row::merge(&inner_row, outer_row)
+                                } else {
+                                    Row::merge(outer_row, &inner_row)
+                                };
+                                if eval_resolved(&merged, &self.resolved)? {
+                                    output_buf.push(merged);
+                                }
                             }
+                            self.state = BlockNestedLoopState::ScanningInner {
+                                inner_file,
+                                outer_batch,
+                                inner_reader,
+                                output_buf,
+                            };
                         }
                     }
                 }

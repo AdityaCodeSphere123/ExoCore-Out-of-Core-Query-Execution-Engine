@@ -61,7 +61,7 @@ impl<'a> SortOperator<'a> {
         let mut run_ids: Vec<TempFileId> = Vec::new();
 
         while let Some(row) = self.underlying.next(ctx)? {
-            bytes_used += estimate_row_size(&row);
+            bytes_used += row.estimate_heap_size();
             rows.push(row);
 
             // Include Vec<Row>'s own backing-store overhead (capacity × 24 bytes
@@ -125,7 +125,13 @@ impl<'a> Operator for SortOperator<'a> {
 }
 
 fn spill_run(ctx: &mut ExecContext, rows: &[Row]) -> Result<TempFileId> {
-    let mut writer = TempRunWriter::new(ctx.temp_storage)?;
+    // Use a larger write batch than the default so each run lands in fewer
+    // extents, reducing seeks during the merge-phase reads.  Cap at 64 pages
+    // (≤ 256 KiB for typical block sizes) so the pre-allocated write buffer
+    // does not compete with the rows already held in memory.
+    let block_size = ctx.temp_storage.block_size().max(1);
+    let batch_pages = (ctx.sort_run_bytes / block_size).max(1).min(64);
+    let mut writer = TempRunWriter::with_batch_pages(ctx.temp_storage, batch_pages)?;
     for row in rows {
         writer.append_row(row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
     }
@@ -160,20 +166,6 @@ fn compare_data(left: &Data, right: &Data) -> Result<Ordering> {
         .ok_or_else(|| anyhow!("cannot compare incompatible data types in sort"))
 }
 
-fn estimate_row_size(row: &Row) -> usize {
-    use std::mem::size_of;
-
-    // 16 bytes: heap allocator metadata for the Vec<Data> backing store
-    let mut total = size_of::<Row>() + row.len() * size_of::<Data>() + 16;
-
-    for value in row.values() {
-        if let Data::String(s) = value {
-            total += s.capacity() + 16; // +16 for string heap alloc metadata
-        }
-    }
-
-    total
-}
 
 struct RunMerger {
     readers: Vec<TempRunReader>,

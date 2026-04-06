@@ -89,3 +89,15 @@ Disk IO metrics DiskIOMetricsResult {
     total_rotational_latency_us: 3862500,
     total_transfer_time_us: 1170337,
 }
+
+# idk what 
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 932,
+    total_writes: 330,
+    total_blocks_processed: 42859,
+    total_cylinders_traveled: 237680,
+    total_io_time_us: 3423203,
+    total_seek_time_us: 373700,
+    total_rotational_latency_us: 1879167,
+    total_transfer_time_us: 1170337,
+}
