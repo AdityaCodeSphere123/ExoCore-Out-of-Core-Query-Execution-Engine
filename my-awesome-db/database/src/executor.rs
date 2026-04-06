@@ -243,8 +243,9 @@ fn execute_op_tree<'a>(
     stats_catalog: &StatsCatalog,
 ) -> Result<Box<dyn Operator + 'a>> {
     match op {
-        QueryOp::Scan(scan_data) => build_scan_operator(ctx, scan_data, needed_above),
-
+        QueryOp::Scan(scan_data) => {
+            build_scan_operator(ctx, scan_data, needed_above, &[], stats_catalog)
+        }
         QueryOp::Filter(filter_data) => {
             if let QueryOp::Cross(cross_data) = filter_data.underlying.as_ref() {
                 if let Some(plan) = try_build_flattened_spj_plan(
@@ -264,11 +265,13 @@ fn execute_op_tree<'a>(
             }
 
             let child_needed = add_predicate_columns(needed_above, &filter_data.predicates);
-            let underlying = execute_op_tree(ctx, &filter_data.underlying, child_needed.as_ref(), stats_catalog)?;
-            Ok(Box::new(filter::FilterOperator::new(
-                underlying,
+            execute_single_relation_leaf(
+                ctx,
+                &filter_data.underlying,
                 &filter_data.predicates,
-            )?))
+                child_needed.as_ref(),
+                stats_catalog,
+            )
         }
 
         QueryOp::Cross(cross_data) => {
@@ -304,11 +307,13 @@ fn build_scan_operator<'a>(
     ctx: &DbContext,
     scan_data: &'a common::query::ScanData,
     needed_above: Option<&HashSet<String>>,
+    scan_predicates: &[Predicate],
+    stats_catalog: &StatsCatalog,
 ) -> Result<Box<dyn Operator + 'a>> {
     let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
     let full_schema = disk::schema_from_table_spec(table_spec);
 
-    if let Some(needed) = needed_above {
+    let mut scan = if let Some(needed) = needed_above {
         let needed_indices: Vec<usize> = full_schema
             .column_names()
             .iter()
@@ -325,17 +330,178 @@ fn build_scan_operator<'a>(
                     .collect(),
             );
             let total_cols = table_spec.column_specs.len();
-            return Ok(Box::new(
-                disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
-                    .with_needed_columns(needed_indices, total_cols),
-            ));
+            disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
+                .with_needed_columns(needed_indices, total_cols)
+        } else {
+            disk::ScanOperator::new(scan_data.table_id.clone(), full_schema)
+        }
+    } else {
+        disk::ScanOperator::new(scan_data.table_id.clone(), full_schema)
+    };
+
+    if let Some(bounds) = ordered_scan_bounds_for_scan(
+        stats_catalog,
+        &scan_data.table_id,
+        table_spec,
+        scan_predicates,
+    ) {
+        scan = scan.with_ordered_bounds(bounds);
+    }
+
+    if !scan_predicates.is_empty() {
+        scan = scan.with_scan_filter_predicates(scan_predicates)?;
+    }
+
+    Ok(Box::new(scan))
+}
+
+fn ordered_scan_bounds_for_scan(
+    stats_catalog: &StatsCatalog,
+    table_id: &str,
+    table_spec: &db_config::table::TableSpec,
+    predicates: &[Predicate],
+) -> Option<disk::OrderedScanBounds> {
+    let mut best: Option<(f64, disk::OrderedScanBounds)> = None;
+
+    for (col_idx, col) in table_spec.column_specs.iter().enumerate() {
+        let col_name = col.column_name.as_str();
+        let col_stats = stats_catalog.column(table_id, col_name)?;
+        if col_stats.is_physically_ordered != Some(true) {
+            continue;
+        }
+
+        let bounds = build_ordered_bounds_from_predicates(col_idx, col_name, predicates)?;
+        let selectivity_hint = predicates
+            .iter()
+            .filter(|pred| pred.column_name == col_name && !matches!(pred.value, ComparisionValue::Column(_)))
+            .map(|pred| estimate_predicate_selectivity(stats_catalog, table_id, pred))
+            .fold(1.0_f64, |acc, s| acc * s);
+
+        match &best {
+            None => best = Some((selectivity_hint, bounds)),
+            Some((best_sel, _)) if selectivity_hint < *best_sel => {
+                best = Some((selectivity_hint, bounds));
+            }
+            _ => {}
         }
     }
 
-    Ok(Box::new(disk::ScanOperator::new(
-        scan_data.table_id.clone(),
-        full_schema,
-    )))
+    best.map(|(_, bounds)| bounds)
+}
+
+fn build_ordered_bounds_from_predicates(
+    ordered_col_idx: usize,
+    column_name: &str,
+    predicates: &[Predicate],
+) -> Option<disk::OrderedScanBounds> {
+    let mut lower: Option<disk::ScanBound> = None;
+    let mut upper: Option<disk::ScanBound> = None;
+    let mut saw_usable = false;
+
+    for pred in predicates {
+        if pred.column_name != column_name {
+            continue;
+        }
+        let value = match comparison_value_to_data(&pred.value) {
+            Some(v) => v,
+            None => continue,
+        };
+        saw_usable = true;
+        match pred.operator {
+            ComparisionOperator::EQ => {
+                let eq_lower = disk::ScanBound { value: value.clone(), inclusive: true };
+                let eq_upper = disk::ScanBound { value, inclusive: true };
+                lower = Some(match lower {
+                    None => eq_lower,
+                    Some(existing) => tighter_lower(existing, eq_lower)?,
+                });
+                upper = Some(match upper {
+                    None => eq_upper,
+                    Some(existing) => tighter_upper(existing, eq_upper)?,
+                });
+            }
+            ComparisionOperator::GT => {
+                let bound = disk::ScanBound { value, inclusive: false };
+                lower = Some(match lower {
+                    None => bound,
+                    Some(existing) => tighter_lower(existing, bound)?,
+                });
+            }
+            ComparisionOperator::GTE => {
+                let bound = disk::ScanBound { value, inclusive: true };
+                lower = Some(match lower {
+                    None => bound,
+                    Some(existing) => tighter_lower(existing, bound)?,
+                });
+            }
+            ComparisionOperator::LT => {
+                let bound = disk::ScanBound { value, inclusive: false };
+                upper = Some(match upper {
+                    None => bound,
+                    Some(existing) => tighter_upper(existing, bound)?,
+                });
+            }
+            ComparisionOperator::LTE => {
+                let bound = disk::ScanBound { value, inclusive: true };
+                upper = Some(match upper {
+                    None => bound,
+                    Some(existing) => tighter_upper(existing, bound)?,
+                });
+            }
+            ComparisionOperator::NE => {}
+        }
+    }
+
+    if !saw_usable {
+        return None;
+    }
+
+    Some(disk::OrderedScanBounds {
+        ordered_col_idx,
+        lower,
+        upper,
+    })
+}
+
+fn comparison_value_to_data(value: &ComparisionValue) -> Option<common::Data> {
+    match value {
+        ComparisionValue::I32(v) => Some(common::Data::Int32(*v)),
+        ComparisionValue::I64(v) => Some(common::Data::Int64(*v)),
+        ComparisionValue::F32(v) => Some(common::Data::Float32(*v)),
+        ComparisionValue::F64(v) => Some(common::Data::Float64(*v)),
+        ComparisionValue::String(v) => Some(common::Data::String(v.clone())),
+        ComparisionValue::Column(_) => None,
+    }
+}
+
+fn tighter_lower(
+    existing: disk::ScanBound,
+    candidate: disk::ScanBound,
+) -> Option<disk::ScanBound> {
+    use std::cmp::Ordering;
+    match existing.value.partial_cmp(&candidate.value)? {
+        Ordering::Less => Some(candidate),
+        Ordering::Greater => Some(existing),
+        Ordering::Equal => Some(disk::ScanBound {
+            value: existing.value,
+            inclusive: existing.inclusive && candidate.inclusive,
+        }),
+    }
+}
+
+fn tighter_upper(
+    existing: disk::ScanBound,
+    candidate: disk::ScanBound,
+) -> Option<disk::ScanBound> {
+    use std::cmp::Ordering;
+    match existing.value.partial_cmp(&candidate.value)? {
+        Ordering::Less => Some(existing),
+        Ordering::Greater => Some(candidate),
+        Ordering::Equal => Some(disk::ScanBound {
+            value: existing.value,
+            inclusive: existing.inclusive && candidate.inclusive,
+        }),
+    }
 }
 
 fn try_build_flattened_spj_plan<'a>(
@@ -479,12 +645,13 @@ fn execute_single_relation_leaf<'a>(
     match op {
         QueryOp::Scan(scan_data) => {
             let needed = add_predicate_columns(needed_above, local_predicates);
-            let scan = build_scan_operator(ctx, scan_data, needed.as_ref())?;
-            if local_predicates.is_empty() {
-                Ok(scan)
-            } else {
-                Ok(Box::new(filter::FilterOperator::new(scan, local_predicates)?))
-            }
+            build_scan_operator(
+                ctx,
+                scan_data,
+                needed.as_ref(),
+                local_predicates,
+                stats_catalog,
+            )
         }
 
         QueryOp::Filter(filter_data) => {
