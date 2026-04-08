@@ -6,11 +6,11 @@ use monitor_config::{
     monitor_config::{DatabaseConfig, QueryConfig},
 };
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, PipeReader, PipeWriter, Read, Write, pipe},
     os::{fd::AsRawFd, unix::process::CommandExt},
-    path::PathBuf,
-    process::{Child, Command},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
 };
 
 use crate::{
@@ -23,6 +23,26 @@ mod fd_mapper;
 
 const MAX_COMMAND_LENGTH: u64 = 1024;
 
+#[derive(Debug, Default, Clone)]
+struct DiskMetricsRow {
+    total_reads: u64,
+    total_writes: u64,
+    total_blocks_processed: u64,
+    total_cylinders_traveled: u64,
+    total_io_time_us: u64,
+    total_seek_time_us: u64,
+    total_rotational_latency_us: u64,
+    total_transfer_time_us: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DbMemMetricsRow {
+    vm_peak_kb: Option<u64>,
+    vm_size_kb: Option<u64>,
+    vm_hwm_kb: Option<u64>,
+    vm_rss_kb: Option<u64>,
+}
+
 fn setup_disk_process(monitor_config: &MonitorConfig) -> Result<(Child, PipeReader, PipeWriter)> {
     let (disk_outbound_reader, disk_outbound_writer) = pipe()?;
     let (disk_inbound_reader, disk_inbound_writer) = pipe()?;
@@ -30,12 +50,12 @@ fn setup_disk_process(monitor_config: &MonitorConfig) -> Result<(Child, PipeRead
     let disk_prog = &monitor_config.get_disk_config().disk_prog;
     let disk_prog_config = &monitor_config.get_disk_config().disk_prog_config;
 
-    // Start disk program
     let disk_process = Command::new(disk_prog)
         .arg("--config")
         .arg(disk_prog_config)
         .stdin(disk_inbound_reader)
         .stdout(disk_outbound_writer)
+        .stderr(Stdio::piped())
         .spawn()?;
 
     Ok((disk_process, disk_outbound_reader, disk_inbound_writer))
@@ -53,9 +73,11 @@ fn setup_db_process(
     let db_prog = &database_config.database_prog;
     let db_prog_config = &database_config.database_prog_config;
 
-    // Setup database program
     let mut db_process = Command::new(db_prog);
-    db_process.arg("--config").arg(db_prog_config);
+    db_process
+        .arg("--config")
+        .arg(db_prog_config)
+        .stderr(Stdio::piped());
 
     let memory_limit = query_config.memory_limit_mb * 1024 * 1024;
 
@@ -111,7 +133,7 @@ fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &Path
             .read_line(&mut row)
             .context("Failed to read row from expected output file")?;
         let trimmed_row = row.trim();
-        if trimmed_row.len() == 0 {
+        if trimmed_row.is_empty() {
             break;
         }
         expected_rows.push(trimmed_row.to_string());
@@ -141,7 +163,7 @@ fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &Path
                 db_in_line
             );
         }
-        if db_in_line.trim().len() == 0 {
+        if db_in_line.trim().is_empty() {
             bail!("Empty line found");
         }
         db_output_rows.push(db_in_line.trim().to_string());
@@ -177,7 +199,7 @@ fn validate_presorted(db_in: &mut impl BufRead, expected_output_file_path: &Path
             .read_line(&mut db_in_line)
             .context("Failed to read line from database output")?;
 
-        if expected_output_line.trim().len() == 0 {
+        if expected_output_line.trim().is_empty() {
             if db_in_line.trim() != "!" {
                 bail!("Expected end of output rows '!'\nbut found\n{}", db_in_line);
             }
@@ -201,13 +223,12 @@ fn handle_db(
     db_out: &mut impl Write,
     query_config: &QueryConfig,
 ) -> Result<()> {
-    // Write provide the query to db
     db_out.write_all(format!("{}\n", serde_json::to_string(&query_config.query)?).as_bytes())?;
     db_out.flush()?;
 
     loop {
         let command = read_command(db_in)?;
-        if command.len() == 0 {
+        if command.is_empty() {
             break;
         }
 
@@ -245,11 +266,144 @@ fn read_command<R: BufRead>(buf_reader: &mut R) -> Result<Vec<String>> {
     }
 }
 
+fn parse_disk_metrics(stderr_text: &str) -> Result<DiskMetricsRow> {
+    let line = stderr_text
+        .lines()
+        .find(|line| line.starts_with("DISK_IO_METRICS,"))
+        .context("disk metrics line not found in disk stderr")?;
+
+    let mut row = DiskMetricsRow::default();
+
+    for field in line.split(',').skip(1) {
+        let (key, value) = field
+            .split_once('=')
+            .with_context(|| format!("invalid disk metrics field: {field}"))?;
+        let parsed: u64 = value
+            .parse()
+            .with_context(|| format!("failed to parse disk metric {key}={value}"))?;
+        match key {
+            "total_reads" => row.total_reads = parsed,
+            "total_writes" => row.total_writes = parsed,
+            "total_blocks_processed" => row.total_blocks_processed = parsed,
+            "total_cylinders_traveled" => row.total_cylinders_traveled = parsed,
+            "total_io_time_us" => row.total_io_time_us = parsed,
+            "total_seek_time_us" => row.total_seek_time_us = parsed,
+            "total_rotational_latency_us" => row.total_rotational_latency_us = parsed,
+            "total_transfer_time_us" => row.total_transfer_time_us = parsed,
+            _ => {}
+        }
+    }
+
+    Ok(row)
+}
+
+fn parse_optional_u64(value: &str) -> Result<Option<u64>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.parse()?))
+    }
+}
+
+fn parse_db_mem_metrics(stderr_text: &str) -> Result<DbMemMetricsRow> {
+    let Some(line) = stderr_text
+        .lines()
+        .find(|line| line.starts_with("DB_MEM_METRICS,"))
+    else {
+        return Ok(DbMemMetricsRow::default());
+    };
+
+    let mut row = DbMemMetricsRow::default();
+
+    for field in line.split(',').skip(1) {
+        let (key, value) = field
+            .split_once('=')
+            .with_context(|| format!("invalid db mem metrics field: {field}"))?;
+        let parsed = parse_optional_u64(value)
+            .with_context(|| format!("failed to parse db mem metric {key}={value}"))?;
+
+        match key {
+            "vm_peak_kb" => row.vm_peak_kb = parsed,
+            "vm_size_kb" => row.vm_size_kb = parsed,
+            "vm_hwm_kb" => row.vm_hwm_kb = parsed,
+            "vm_rss_kb" => row.vm_rss_kb = parsed,
+            _ => {}
+        }
+    }
+
+    Ok(row)
+}
+
+fn csv_escape(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
+}
+
+fn fmt_opt_u64(v: Option<u64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
+fn fmt_opt_f64(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.3}")).unwrap_or_default()
+}
+
+fn create_metrics_csv(path: &Path) -> Result<File> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+
+    writeln!(
+        file,
+        "execution_name,total_reads,total_writes,total_blocks_processed,total_cylinders_traveled,total_io_time_us,total_seek_time_us,total_rotational_latency_us,total_transfer_time_us,db_vm_peak_kb,db_vm_size_kb,db_vm_hwm_kb,db_vm_rss_kb,db_vm_peak_pct_of_limit"
+    )?;
+
+    Ok(file)
+}
+
+fn append_metrics_row(
+    csv_file: &mut File,
+    execution_name: &str,
+    metrics: &DiskMetricsRow,
+    db_mem: &DbMemMetricsRow,
+    memory_limit_mb: u64,
+) -> Result<()> {
+    let memory_limit_kb = memory_limit_mb * 1024;
+    let peak_vm_pct = db_mem
+        .vm_peak_kb
+        .map(|v| (v as f64) * 100.0 / (memory_limit_kb as f64));
+
+    writeln!(
+        csv_file,
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        csv_escape(execution_name),
+        metrics.total_reads,
+        metrics.total_writes,
+        metrics.total_blocks_processed,
+        metrics.total_cylinders_traveled,
+        metrics.total_io_time_us,
+        metrics.total_seek_time_us,
+        metrics.total_rotational_latency_us,
+        metrics.total_transfer_time_us,
+        fmt_opt_u64(db_mem.vm_peak_kb),
+        fmt_opt_u64(db_mem.vm_size_kb),
+        fmt_opt_u64(db_mem.vm_hwm_kb),
+        fmt_opt_u64(db_mem.vm_rss_kb),
+        fmt_opt_f64(peak_vm_pct),
+    )?;
+    csv_file.flush()?;
+    Ok(())
+}
+
 fn monitor_main() -> Result<()> {
     let cli_options = CliOptions::parse();
 
     let monitor_config = MonitorConfig::load_config(cli_options.get_config_path())
         .context("Failed to load monitor config")?;
+
+    let csv_path = PathBuf::from("disk_io_metrics.csv");
+    let mut csv_file = create_metrics_csv(&csv_path)?;
 
     for query_config in monitor_config.get_query_configs() {
         if query_config.disabled {
@@ -267,19 +421,38 @@ fn monitor_main() -> Result<()> {
         )?;
 
         let mut db_in = BufReader::new(db_outbound_reader);
-        let db_result = handle_db(&mut db_in, &mut db_inbound_writer, &query_config);
+        let db_result = handle_db(&mut db_in, &mut db_inbound_writer, query_config);
 
-        if let Err(_) = &db_result {
-            db_process.kill()?;
-        } else {
-            db_process.wait()?;
+        if db_result.is_err() {
+            let _ = db_process.kill();
+        }
+        let _ = db_process.wait();
+
+        let mut db_stderr = String::new();
+        if let Some(stderr) = db_process.stderr.as_mut() {
+            stderr.read_to_string(&mut db_stderr)?;
+        }
+        let db_mem_metrics = parse_db_mem_metrics(&db_stderr)
+            .with_context(|| format!("failed to parse db memory metrics for {}", query_config.execution_name))?;
+
+        let mut disk_stderr = String::new();
+        let _disk_status = disk_process.wait()?;
+        if let Some(stderr) = disk_process.stderr.as_mut() {
+            stderr.read_to_string(&mut disk_stderr)?;
         }
 
-        disk_process.wait()?;
+        let disk_metrics = parse_disk_metrics(&disk_stderr)
+            .with_context(|| format!("failed to parse disk metrics for {}", query_config.execution_name))?;
 
-        println!(
-            "--------------------------------------------------------------------------------"
-        );
+        append_metrics_row(
+            &mut csv_file,
+            &query_config.execution_name,
+            &disk_metrics,
+            &db_mem_metrics,
+            query_config.memory_limit_mb,
+        )?;
+
+        println!("--------------------------------------------------------------------------------");
         println!();
 
         db_result.context(format!(
@@ -290,6 +463,7 @@ fn monitor_main() -> Result<()> {
         println!("Validation success! for {}", query_config.execution_name);
     }
 
+    println!("Saved disk IO metrics CSV to disk_io_metrics.csv");
     Ok(())
 }
 

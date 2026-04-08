@@ -601,14 +601,13 @@ fn try_build_flattened_spj_plan<'a>(
         });
 
         // Update the accumulated row estimate for the next join step.
+        // Use the same density-based estimate that the DP optimizer used so
+        // that the BNLJ spill hint is consistent with the chosen plan.
         if current_subset.is_empty() {
             current_rows = leaf_rows;
         } else {
-            let has_equi = join_preds
-                .iter()
-                .any(|p| matches!(p.operator, ComparisionOperator::EQ));
-            let join_sel = if has_equi { EQ_JOIN_SELECTIVITY } else { OTHER_JOIN_SELECTIVITY };
-            current_rows = (current_rows * leaf_rows * join_sel).max(1.0);
+            let step_infos = step_join_predicates(current_mask, leaf_idx, &classification.join_predicates);
+            current_rows = estimate_join_rows(current_rows, leaf_rows, &step_infos, &leaves, stats_catalog);
         }
 
         current_subset.push(leaf_idx);
@@ -1308,7 +1307,19 @@ fn estimate_join_step<'a>(
     let join_work = if has_equi {
         left.pages + right.pages + output_pages
     } else {
-        left.pages + (left.pages * right.pages) + output_pages
+        // BNLJ: the smaller side is spilled once (inner) and the larger side is
+        // loaded in batches (outer).  Each outer batch re-scans the full inner.
+        //   cost = inner_spill + outer_read + num_passes * inner_read + output
+        // where num_passes = ceil(outer.pages / batch_size).
+        // This is far cheaper than the naive left.pages * right.pages estimate
+        // because the outer side is processed in large memory-sized chunks.
+        let (inner_pages, outer_pages) = if left.pages <= right.pages {
+            (left.pages, right.pages)
+        } else {
+            (right.pages, left.pages)
+        };
+        let num_passes = (outer_pages / BNLJ_COST_BATCH_PAGES).ceil().max(1.0);
+        inner_pages + outer_pages + num_passes * inner_pages + output_pages
     };
 
     let _ = right_original_pos; // unused after tie_break removal
@@ -1545,21 +1556,36 @@ fn estimate_equi_join_selectivity<'a>(
     leaves: &[SpjLeaf<'a>],
     stats_catalog: &StatsCatalog,
 ) -> Option<f64> {
-    let left_col = resolve_column_in_leaf(leaves[info.left_leaf].op, &info.predicate.column_name)?;
+    // `info.left_leaf` / `info.right_leaf` are sorted by leaf index (smaller,
+    // larger) and do NOT necessarily correspond to the two sides of the
+    // predicate.  `predicate.column_name` may belong to *either* leaf, so we
+    // consult the schemas to find the correct owner before resolving.
+    let pred_col_leaf = if leaves[info.left_leaf].schema.contains(&info.predicate.column_name) {
+        info.left_leaf
+    } else {
+        info.right_leaf
+    };
+    let other_col_leaf = if pred_col_leaf == info.left_leaf {
+        info.right_leaf
+    } else {
+        info.left_leaf
+    };
+
+    let pred_col = resolve_column_in_leaf(leaves[pred_col_leaf].op, &info.predicate.column_name)?;
     let right_name = match &info.predicate.value {
         ComparisionValue::Column(c) => c.as_str(),
         _ => return None,
     };
-    let right_col = resolve_column_in_leaf(leaves[info.right_leaf].op, right_name)?;
+    let other_col = resolve_column_in_leaf(leaves[other_col_leaf].op, right_name)?;
 
-    let left_rows = stats_catalog.row_count(&left_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
-    let right_rows = stats_catalog.row_count(&right_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
-    let left_density = stats_catalog.column(&left_col.0, &left_col.1)?.density?;
-    let right_density = stats_catalog.column(&right_col.0, &right_col.1)?.density?;
+    let pred_rows = stats_catalog.row_count(&pred_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let other_rows = stats_catalog.row_count(&other_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let pred_density = stats_catalog.column(&pred_col.0, &pred_col.1)?.density?;
+    let other_density = stats_catalog.column(&other_col.0, &other_col.1)?.density?;
 
-    let left_ndv = (left_rows * left_density).max(1.0);
-    let right_ndv = (right_rows * right_density).max(1.0);
-    Some((1.0 / left_ndv.max(right_ndv)).clamp(MIN_SELECTIVITY, 1.0_f64))
+    let pred_ndv = (pred_rows * pred_density).max(1.0);
+    let other_ndv = (other_rows * other_density).max(1.0);
+    Some((1.0 / pred_ndv.max(other_ndv)).clamp(MIN_SELECTIVITY, 1.0_f64))
 }
 
 fn resolve_column_in_leaf(op: &QueryOp, column_name: &str) -> Option<(String, String)> {
@@ -1598,6 +1624,10 @@ const NE_PRED_SELECTIVITY: f64 = 0.90;
 const RANGE_PRED_SELECTIVITY: f64 = 0.33;
 const EQ_JOIN_SELECTIVITY: f64 = 0.001;
 const OTHER_JOIN_SELECTIVITY: f64 = 0.10;
+// Expected BNLJ outer-batch size (pages) used for cost estimation.  Matches
+// MAX_BNLJ_OUTER_BATCH_PAGES in join.rs so the cost model reflects the actual
+// execution behaviour after the batch-size increase.
+const BNLJ_COST_BATCH_PAGES: f64 = 512.0;
 
 fn add_predicate_columns(
     needed: Option<&HashSet<String>>,

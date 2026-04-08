@@ -1,7 +1,7 @@
 use anyhow::Result;
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
@@ -38,11 +38,29 @@ fn make_key(row: &Row, indices: &[usize]) -> JoinKey {
     JoinKey(indices.iter().map(|&i| to_key_field(&row.values()[i])).collect())
 }
 
+fn estimate_join_key_heap_size(key: &JoinKey) -> usize {
+    use std::mem::size_of;
+
+    let mut total = size_of::<JoinKey>() + key.0.len() * size_of::<KeyField>() + 16;
+    for field in &key.0 {
+        if let KeyField::Str(s) = field {
+            total += s.capacity() + 16;
+        }
+    }
+    total
+}
+
 /// Compute partition number directly from row values.
 /// Avoids allocating a JoinKey (Vec + String clones) during the partitioning
 /// phase where we only need the hash, not a comparable key.
-fn partition_hash(row: &Row, indices: &[usize], num_partitions: usize) -> usize {
+fn partition_hash_with_salt(
+    row: &Row,
+    indices: &[usize],
+    num_partitions: usize,
+    salt: u64,
+) -> usize {
     let mut h = DefaultHasher::new();
+    salt.hash(&mut h);
     for &i in indices {
         match &row.values()[i] {
             Data::Int32(v) => v.hash(&mut h),
@@ -58,6 +76,11 @@ fn partition_hash(row: &Row, indices: &[usize], num_partitions: usize) -> usize 
 const MIN_HASH_JOIN_PARTITIONS: usize = 8;
 const MAX_HASH_JOIN_PARTITIONS: usize = 32;
 const TARGET_PARTITION_PAGES: usize = 256;
+const HASH_JOIN_MAX_REPARTITION_DEPTH: usize = 3;
+const HASH_JOIN_BUILD_READER_PAGES: usize = 64;
+const HASH_JOIN_PROBE_READER_PAGES: usize = 64;
+const HASH_JOIN_BUILD_MISC_RESERVE_BYTES: usize = 256 * 1024;
+const HASH_JOIN_ENTRY_OVERHEAD_BYTES: usize = 64;
 
 fn choose_num_partitions(ctx: &ExecContext) -> usize {
     let block_size = ctx.temp_storage.block_size();
@@ -72,6 +95,16 @@ fn choose_writer_batch(sort_run_bytes: usize, block_size: usize, num_partitions:
     let per_writer = budget / num_partitions.max(1);
     let batch_pages = per_writer / block_size.max(1);
     batch_pages.clamp(4, 64)
+}
+
+fn choose_hash_build_budget_bytes(ctx: &ExecContext) -> usize {
+    let block_size = ctx.temp_storage.block_size().max(1);
+    let reader_reserve = (HASH_JOIN_BUILD_READER_PAGES + HASH_JOIN_PROBE_READER_PAGES)
+        .saturating_mul(block_size);
+    ctx.sort_run_bytes
+        .saturating_sub(reader_reserve)
+        .saturating_sub(HASH_JOIN_BUILD_MISC_RESERVE_BYTES)
+        .max(block_size)
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -170,6 +203,31 @@ fn build_join_impl<'a>(
 
 // ── Grace Hash Join ───────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+struct PartitionTask {
+    left_file: TempFileId,
+    right_file: TempFileId,
+    depth: usize,
+    salt: u64,
+}
+
+enum ActivePartition {
+    Hash {
+        task: PartitionTask,
+        build_map: HashMap<JoinKey, Vec<Row>>,
+        probe_reader: TempRunReader,
+        build_is_left: bool,
+    },
+    NestedLoop {
+        task: PartitionTask,
+        inner_is_left: bool,
+        inner_file: TempFileId,
+        outer_reader: TempRunReader,
+        outer_batch: Vec<Row>,
+        inner_reader: TempRunReader,
+    },
+}
+
 pub struct HashJoinOperator<'a> {
     left: Option<Box<dyn Operator + 'a>>,
     right: Option<Box<dyn Operator + 'a>>,
@@ -187,17 +245,14 @@ enum HashJoinState {
 }
 
 struct ProbingState {
-    left_parts: Vec<TempFileId>,
-    right_parts: Vec<TempFileId>,
-    current_part: usize,
-    /// Build-side hash table for the current partition.
-    build_map: HashMap<JoinKey, Vec<Row>>,
-    /// Streaming reader over the probe partition, None before loaded.
-    probe_reader: Option<TempRunReader>,
-    /// Buffered output rows not yet returned to the caller.
+    pending_tasks: VecDeque<PartitionTask>,
+    active: Option<ActivePartition>,
     output_buf: Vec<Row>,
-    /// True when the build side is the left table for the current partition.
-    build_is_left: bool,
+}
+
+enum PreparedPartition {
+    Active(ActivePartition),
+    Repartition(VecDeque<PartitionTask>),
 }
 
 impl<'a> HashJoinOperator<'a> {
@@ -228,10 +283,7 @@ impl<'a> HashJoinOperator<'a> {
     ///
     /// We also only keep partitions where both sides are non-empty. One-sided
     /// partitions can never produce output, so we discard them before probing.
-    fn partition_inputs(
-        &mut self,
-        ctx: &mut ExecContext,
-    ) -> Result<(Vec<TempFileId>, Vec<TempFileId>)> {
+    fn partition_inputs(&mut self, ctx: &mut ExecContext) -> Result<VecDeque<PartitionTask>> {
         let num_partitions = choose_num_partitions(ctx);
         let writer_batch = choose_writer_batch(
             ctx.sort_run_bytes,
@@ -244,7 +296,6 @@ impl<'a> HashJoinOperator<'a> {
         let mut right_writers: Vec<Option<TempRunWriter>> =
             (0..num_partitions).map(|_| None).collect();
 
-        // Partition left — use allocation-free hashing.
         let mut left = self.left.take().expect("left already consumed");
         loop {
             let maybe = left.next(ctx)?;
@@ -252,26 +303,22 @@ impl<'a> HashJoinOperator<'a> {
                 Some(r) => r,
                 None => break,
             };
-            let part = partition_hash(&row, &self.left_key_indices, num_partitions);
+            let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
             if left_writers[part].is_none() {
                 left_writers[part] = Some(TempRunWriter::with_batch_pages(
                     ctx.temp_storage,
                     writer_batch,
                 )?);
             }
-            left_writers[part]
-                .as_mut()
-                .unwrap()
-                .append_row(
-                    &row,
-                    ctx.temp_storage,
-                    &mut *ctx.disk_reader,
-                    &mut *ctx.disk_writer,
-                )?;
+            left_writers[part].as_mut().unwrap().append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?;
         }
         drop(left);
 
-        // Partition right.
         let mut right = self.right.take().expect("right already consumed");
         loop {
             let maybe = right.next(ctx)?;
@@ -279,27 +326,23 @@ impl<'a> HashJoinOperator<'a> {
                 Some(r) => r,
                 None => break,
             };
-            let part = partition_hash(&row, &self.right_key_indices, num_partitions);
+            let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
             if right_writers[part].is_none() {
                 right_writers[part] = Some(TempRunWriter::with_batch_pages(
                     ctx.temp_storage,
                     writer_batch,
                 )?);
             }
-            right_writers[part]
-                .as_mut()
-                .unwrap()
-                .append_row(
-                    &row,
-                    ctx.temp_storage,
-                    &mut *ctx.disk_reader,
-                    &mut *ctx.disk_writer,
-                )?;
+            right_writers[part].as_mut().unwrap().append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?;
         }
         drop(right);
 
-        let mut left_parts = Vec::new();
-        let mut right_parts = Vec::new();
+        let mut tasks = VecDeque::new();
 
         for part in 0..num_partitions {
             match (left_writers[part].take(), right_writers[part].take()) {
@@ -314,8 +357,12 @@ impl<'a> HashJoinOperator<'a> {
                         &mut *ctx.disk_reader,
                         &mut *ctx.disk_writer,
                     )?;
-                    left_parts.push(left_file);
-                    right_parts.push(right_file);
+                    tasks.push_back(PartitionTask {
+                        left_file,
+                        right_file,
+                        depth: 0,
+                        salt: 0,
+                    });
                 }
                 (Some(left_writer), None) => {
                     let file_id = left_writer.file_id();
@@ -331,8 +378,288 @@ impl<'a> HashJoinOperator<'a> {
             }
         }
 
-        Ok((left_parts, right_parts))
+        Ok(tasks)
     }
+
+    fn repartition_task(
+        &self,
+        ctx: &mut ExecContext,
+        task: PartitionTask,
+    ) -> Result<VecDeque<PartitionTask>> {
+        let num_partitions = choose_num_partitions(ctx);
+        let writer_batch = choose_writer_batch(
+            ctx.sort_run_bytes,
+            ctx.temp_storage.block_size(),
+            num_partitions,
+        );
+        let next_depth = task.depth + 1;
+        let next_salt = task
+            .salt
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(next_depth as u64 + 1);
+
+        let mut left_writers: Vec<Option<TempRunWriter>> =
+            (0..num_partitions).map(|_| None).collect();
+        let mut right_writers: Vec<Option<TempRunWriter>> =
+            (0..num_partitions).map(|_| None).collect();
+
+        let mut left_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            task.left_file,
+            HASH_JOIN_BUILD_READER_PAGES,
+        )?;
+        while let Some(row) = left_reader.next_row(
+            ctx.temp_storage,
+            &mut *ctx.disk_reader,
+            &mut *ctx.disk_writer,
+        )? {
+            let part = partition_hash_with_salt(
+                &row,
+                &self.left_key_indices,
+                num_partitions,
+                next_salt,
+            );
+            if left_writers[part].is_none() {
+                left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                    ctx.temp_storage,
+                    writer_batch,
+                )?);
+            }
+            left_writers[part].as_mut().unwrap().append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?;
+        }
+        drop(left_reader);
+
+        let mut right_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            task.right_file,
+            HASH_JOIN_BUILD_READER_PAGES,
+        )?;
+        while let Some(row) = right_reader.next_row(
+            ctx.temp_storage,
+            &mut *ctx.disk_reader,
+            &mut *ctx.disk_writer,
+        )? {
+            let part = partition_hash_with_salt(
+                &row,
+                &self.right_key_indices,
+                num_partitions,
+                next_salt,
+            );
+            if right_writers[part].is_none() {
+                right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                    ctx.temp_storage,
+                    writer_batch,
+                )?);
+            }
+            right_writers[part].as_mut().unwrap().append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?;
+        }
+        drop(right_reader);
+
+        ctx.temp_storage.delete_temp_file(task.left_file)?;
+        ctx.temp_storage.delete_temp_file(task.right_file)?;
+
+        let mut children = VecDeque::new();
+        for part in 0..num_partitions {
+            match (left_writers[part].take(), right_writers[part].take()) {
+                (Some(left_writer), Some(right_writer)) => {
+                    let left_file = left_writer.finish(
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                    let right_file = right_writer.finish(
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                    children.push_back(PartitionTask {
+                        left_file,
+                        right_file,
+                        depth: next_depth,
+                        salt: next_salt,
+                    });
+                }
+                (Some(left_writer), None) => {
+                    let file_id = left_writer.file_id();
+                    drop(left_writer);
+                    ctx.temp_storage.delete_temp_file(file_id)?;
+                }
+                (None, Some(right_writer)) => {
+                    let file_id = right_writer.file_id();
+                    drop(right_writer);
+                    ctx.temp_storage.delete_temp_file(file_id)?;
+                }
+                (None, None) => {}
+            }
+        }
+
+        Ok(children)
+    }
+
+    fn cleanup_task(&self, ctx: &mut ExecContext, task: PartitionTask) -> Result<()> {
+        ctx.temp_storage.delete_temp_file(task.left_file)?;
+        ctx.temp_storage.delete_temp_file(task.right_file)?;
+        Ok(())
+    }
+
+    fn prepare_nested_loop_partition(
+        &self,
+        ctx: &mut ExecContext,
+        task: PartitionTask,
+    ) -> Result<PreparedPartition> {
+        let left_pages = ctx.temp_storage.num_pages(task.left_file)?;
+        let right_pages = ctx.temp_storage.num_pages(task.right_file)?;
+        let (inner_file, outer_file, inner_is_left) = if left_pages <= right_pages {
+            (task.left_file, task.right_file, true)
+        } else {
+            (task.right_file, task.left_file, false)
+        };
+
+        let mut outer_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            outer_file,
+            HASH_JOIN_PROBE_READER_PAGES,
+        )?;
+        let outer_batch = fill_temp_outer_batch(&mut outer_reader, ctx)?;
+        if outer_batch.is_empty() {
+            self.cleanup_task(ctx, task)?;
+            return Ok(PreparedPartition::Repartition(VecDeque::new()));
+        }
+
+        let inner_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            inner_file,
+            HASH_JOIN_BUILD_READER_PAGES,
+        )?;
+
+        Ok(PreparedPartition::Active(ActivePartition::NestedLoop {
+            task,
+            inner_is_left,
+            inner_file,
+            outer_reader,
+            outer_batch,
+            inner_reader,
+        }))
+    }
+
+    fn prepare_task(
+        &self,
+        ctx: &mut ExecContext,
+        task: PartitionTask,
+    ) -> Result<PreparedPartition> {
+        let build_budget = choose_hash_build_budget_bytes(ctx);
+        let left_pages = ctx.temp_storage.num_pages(task.left_file)?;
+        let right_pages = ctx.temp_storage.num_pages(task.right_file)?;
+        let (build_file, probe_file, build_keys, build_is_left, build_pages) = if left_pages <= right_pages {
+            (
+                task.left_file,
+                task.right_file,
+                &self.left_key_indices as &[usize],
+                true,
+                left_pages,
+            )
+        } else {
+            (
+                task.right_file,
+                task.left_file,
+                &self.right_key_indices as &[usize],
+                false,
+                right_pages,
+            )
+        };
+
+        let block_size = ctx.temp_storage.block_size().max(1);
+        if build_pages.saturating_mul(block_size as u64) as usize > build_budget.saturating_mul(2)
+            && task.depth < HASH_JOIN_MAX_REPARTITION_DEPTH
+        {
+            return Ok(PreparedPartition::Repartition(self.repartition_task(ctx, task)?));
+        }
+
+        let mut build_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            build_file,
+            HASH_JOIN_BUILD_READER_PAGES,
+        )?;
+        let mut build_map: HashMap<JoinKey, Vec<Row>> = HashMap::new();
+        let mut bytes_used = 0usize;
+
+        while let Some(row) = build_reader.next_row(
+            ctx.temp_storage,
+            &mut *ctx.disk_reader,
+            &mut *ctx.disk_writer,
+        )? {
+            let key = make_key(&row, build_keys);
+            let row_bytes = row.estimate_heap_size();
+            let key_bytes = estimate_join_key_heap_size(&key);
+            let projected = bytes_used
+                .saturating_add(row_bytes)
+                .saturating_add(key_bytes)
+                .saturating_add(HASH_JOIN_ENTRY_OVERHEAD_BYTES);
+
+            if projected > build_budget {
+                drop(build_reader);
+                drop(build_map);
+                if task.depth < HASH_JOIN_MAX_REPARTITION_DEPTH {
+                    return Ok(PreparedPartition::Repartition(self.repartition_task(ctx, task)?));
+                }
+                return self.prepare_nested_loop_partition(ctx, task);
+            }
+
+            bytes_used = projected;
+            build_map.entry(key).or_default().push(row);
+        }
+        drop(build_reader);
+
+        let probe_reader = TempRunReader::with_batch_pages(
+            ctx.temp_storage,
+            probe_file,
+            HASH_JOIN_PROBE_READER_PAGES,
+        )?;
+
+        Ok(PreparedPartition::Active(ActivePartition::Hash {
+            task,
+            build_map,
+            probe_reader,
+            build_is_left,
+        }))
+    }
+}
+
+fn fill_temp_outer_batch(
+    reader: &mut TempRunReader,
+    ctx: &mut ExecContext,
+) -> Result<Vec<Row>> {
+    let target_bytes = choose_bnlj_outer_batch_bytes(ctx);
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+
+    loop {
+        let row = match reader.next_row(
+            ctx.temp_storage,
+            &mut *ctx.disk_reader,
+            &mut *ctx.disk_writer,
+        )? {
+            Some(r) => r,
+            None => break,
+        };
+        bytes = bytes.saturating_add(row.estimate_heap_size());
+        batch.push(row);
+        if bytes >= target_bytes {
+            break;
+        }
+    }
+
+    Ok(batch)
 }
 
 impl<'a> Operator for HashJoinOperator<'a> {
@@ -344,116 +671,147 @@ impl<'a> Operator for HashJoinOperator<'a> {
         loop {
             match std::mem::replace(&mut self.state, HashJoinState::Done) {
                 HashJoinState::NotStarted => {
-                    let (lp, rp) = self.partition_inputs(ctx)?;
+                    let tasks = self.partition_inputs(ctx)?;
                     self.state = HashJoinState::Probing(ProbingState {
-                        left_parts: lp,
-                        right_parts: rp,
-                        current_part: 0,
-                        build_map: HashMap::new(),
-                        probe_reader: None,
+                        pending_tasks: tasks,
+                        active: None,
                         output_buf: Vec::new(),
-                        build_is_left: true,
                     });
                 }
 
                 HashJoinState::Done => return Ok(None),
 
                 HashJoinState::Probing(mut ps) => {
-                    // Return any rows already matched but not yet emitted.
-                    if !ps.output_buf.is_empty() {
-                        let row = ps.output_buf.pop().unwrap();
+                    if let Some(row) = ps.output_buf.pop() {
                         self.state = HashJoinState::Probing(ps);
                         return Ok(Some(row));
                     }
 
-                    // Load the next partition if we haven't started it yet.
-                    if ps.probe_reader.is_none() {
-                        if ps.current_part >= ps.left_parts.len() {
-                            return Ok(None);
-                        }
-
-                        // Pick the smaller side to build the hash table from.
-                        let left_file = ps.left_parts[ps.current_part];
-                        let right_file = ps.right_parts[ps.current_part];
-                        let left_pages = ctx.temp_storage.num_pages(left_file)?;
-                        let right_pages = ctx.temp_storage.num_pages(right_file)?;
-
-                        let (build_file, probe_file, build_keys) = if left_pages <= right_pages {
-                            ps.build_is_left = true;
-                            (left_file, right_file, &self.left_key_indices as &[usize])
-                        } else {
-                            ps.build_is_left = false;
-                            (right_file, left_file, &self.right_key_indices as &[usize])
+                    while ps.active.is_none() {
+                        let task = match ps.pending_tasks.pop_front() {
+                            Some(task) => task,
+                            None => return Ok(None),
                         };
 
-                        // Build hash table from smaller partition.
-                        let mut lr = TempRunReader::new(ctx.temp_storage, build_file)?;
-                        ps.build_map.clear();
-                        loop {
-                            let maybe = lr.next_row(
+                        match self.prepare_task(ctx, task)? {
+                            PreparedPartition::Active(active) => ps.active = Some(active),
+                            PreparedPartition::Repartition(mut children) => {
+                                while let Some(child) = children.pop_back() {
+                                    ps.pending_tasks.push_front(child);
+                                }
+                            }
+                        }
+                    }
+
+                    match ps.active.take().unwrap() {
+                        ActivePartition::Hash {
+                            task,
+                            build_map,
+                            mut probe_reader,
+                            build_is_left,
+                        } => {
+                            let probe_row = probe_reader.next_row(
                                 ctx.temp_storage,
                                 &mut *ctx.disk_reader,
                                 &mut *ctx.disk_writer,
                             )?;
-                            let row = match maybe {
-                                Some(r) => r,
-                                None => break,
-                            };
-                            let key = make_key(&row, build_keys);
-                            ps.build_map.entry(key).or_default().push(row);
-                        }
 
-                        ps.probe_reader =
-                            Some(TempRunReader::new(ctx.temp_storage, probe_file)?);
-                    }
-
-                    // Fetch next probe row.
-                    let probe_row = {
-                        let reader = ps.probe_reader.as_mut().unwrap();
-                        reader.next_row(
-                            ctx.temp_storage,
-                            &mut *ctx.disk_reader,
-                            &mut *ctx.disk_writer,
-                        )?
-                    };
-
-                    match probe_row {
-                        None => {
-                            // This partition is done.  Delete both temp files
-                            // immediately so disk space is reclaimed before the
-                            // next partition is loaded, rather than holding all
-                            // partition files open until the operator is dropped.
-                            ctx.temp_storage
-                                .delete_temp_file(ps.left_parts[ps.current_part])?;
-                            ctx.temp_storage
-                                .delete_temp_file(ps.right_parts[ps.current_part])?;
-                            ps.current_part += 1;
-                            ps.probe_reader = None;
-                            ps.build_map.clear();
-                            self.state = HashJoinState::Probing(ps);
-                        }
-                        Some(probe_row) => {
-                            let probe_keys: &[usize] = if ps.build_is_left {
-                                &self.right_key_indices
-                            } else {
-                                &self.left_key_indices
-                            };
-                            let key = make_key(&probe_row, probe_keys);
-                            if let Some(build_rows) = ps.build_map.get(&key) {
-                                for build_row in build_rows {
-                                    // Maintain [left, right] column order regardless
-                                    // of which side we built from.
-                                    let merged = if ps.build_is_left {
-                                        Row::merge(build_row, &probe_row)
+                            match probe_row {
+                                None => {
+                                    self.cleanup_task(ctx, task)?;
+                                    self.state = HashJoinState::Probing(ps);
+                                }
+                                Some(probe_row) => {
+                                    let probe_keys: &[usize] = if build_is_left {
+                                        &self.right_key_indices
                                     } else {
-                                        Row::merge(&probe_row, build_row)
+                                        &self.left_key_indices
                                     };
-                                    if eval_resolved(&merged, &self.resolved_extra)? {
-                                        ps.output_buf.push(merged);
+                                    let key = make_key(&probe_row, probe_keys);
+                                    if let Some(build_rows) = build_map.get(&key) {
+                                        for build_row in build_rows {
+                                            let merged = if build_is_left {
+                                                Row::merge(build_row, &probe_row)
+                                            } else {
+                                                Row::merge(&probe_row, build_row)
+                                            };
+                                            if eval_resolved(&merged, &self.resolved_extra)? {
+                                                ps.output_buf.push(merged);
+                                            }
+                                        }
+                                    }
+
+                                    ps.active = Some(ActivePartition::Hash {
+                                        task,
+                                        build_map,
+                                        probe_reader,
+                                        build_is_left,
+                                    });
+                                    self.state = HashJoinState::Probing(ps);
+                                }
+                            }
+                        }
+
+                        ActivePartition::NestedLoop {
+                            task,
+                            inner_is_left,
+                            inner_file,
+                            mut outer_reader,
+                            mut outer_batch,
+                            mut inner_reader,
+                        } => {
+                            let maybe_inner = inner_reader.next_row(
+                                ctx.temp_storage,
+                                &mut *ctx.disk_reader,
+                                &mut *ctx.disk_writer,
+                            )?;
+
+                            match maybe_inner {
+                                Some(inner_row) => {
+                                    for outer_row in outer_batch.iter().rev() {
+                                        let merged = if inner_is_left {
+                                            Row::merge(&inner_row, outer_row)
+                                        } else {
+                                            Row::merge(outer_row, &inner_row)
+                                        };
+                                        if eval_resolved(&merged, &self.resolved_extra)? {
+                                            ps.output_buf.push(merged);
+                                        }
+                                    }
+
+                                    ps.active = Some(ActivePartition::NestedLoop {
+                                        task,
+                                        inner_is_left,
+                                        inner_file,
+                                        outer_reader,
+                                        outer_batch,
+                                        inner_reader,
+                                    });
+                                    self.state = HashJoinState::Probing(ps);
+                                }
+                                None => {
+                                    outer_batch = fill_temp_outer_batch(&mut outer_reader, ctx)?;
+                                    if outer_batch.is_empty() {
+                                        self.cleanup_task(ctx, task)?;
+                                        self.state = HashJoinState::Probing(ps);
+                                    } else {
+                                        let inner_reader = TempRunReader::with_batch_pages(
+                                            ctx.temp_storage,
+                                            inner_file,
+                                            HASH_JOIN_BUILD_READER_PAGES,
+                                        )?;
+                                        ps.active = Some(ActivePartition::NestedLoop {
+                                            task,
+                                            inner_is_left,
+                                            inner_file,
+                                            outer_reader,
+                                            outer_batch,
+                                            inner_reader,
+                                        });
+                                        self.state = HashJoinState::Probing(ps);
                                     }
                                 }
                             }
-                            self.state = HashJoinState::Probing(ps);
                         }
                     }
                 }
@@ -501,9 +859,7 @@ pub struct BlockNestedLoopJoinOperator<'a> {
 
 enum BlockNestedLoopState {
     NotStarted,
-    NeedOuterBatch {
-        inner_file: TempFileId,
-    },
+    NeedOuterBatch { inner_file: TempFileId },
     ScanningInner {
         inner_file: TempFileId,
         outer_batch: Vec<Row>,
@@ -523,16 +879,12 @@ impl<'a> BlockNestedLoopJoinOperator<'a> {
     ) -> Result<Self> {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
-        // merged_schema always preserves [left | right] column order so that
-        // resolved predicate indices and output row layout are stable.
         let merged_schema = RowSchema::merge(&left_schema, &right_schema);
         let resolved = resolve_predicates(&merged_schema, &predicates)?;
 
-        // Choose which side to spill.  Spilling the *smaller* side means we
-        // read fewer pages on each rescan, directly reducing disk I/O.
         let inner_is_left = match (left_rows_hint, right_rows_hint) {
-            (Some(l), Some(r)) => l <= r, // left is smaller → left is inner
-            _ => true,                    // no hints → preserve original behaviour
+            (Some(l), Some(r)) => l <= r,
+            _ => true,
         };
         let (inner, outer) = if inner_is_left {
             (left, right)
@@ -551,9 +903,6 @@ impl<'a> BlockNestedLoopJoinOperator<'a> {
     }
 
     fn spill_inner(&mut self, ctx: &mut ExecContext) -> Result<TempFileId> {
-        // Use a larger write batch so the inner file lands in fewer extents,
-        // reducing seeks on each outer-batch rescan.  Cap at 64 pages so the
-        // pre-allocated write buffer fits comfortably in the memory budget.
         let block_size = ctx.temp_storage.block_size().max(1);
         let batch_pages = (ctx.sort_run_bytes / block_size).max(1).min(64);
         let mut writer = TempRunWriter::with_batch_pages(ctx.temp_storage, batch_pages)?;
@@ -563,7 +912,12 @@ impl<'a> BlockNestedLoopJoinOperator<'a> {
                 Some(r) => r,
                 None => break,
             };
-            writer.append_row(&row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
+            writer.append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?;
         }
         writer.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)
     }
@@ -645,12 +999,10 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
 
                     match maybe_inner {
                         None => {
-                            // Inner exhausted; get the next outer batch.
                             self.state = BlockNestedLoopState::NeedOuterBatch { inner_file };
                         }
                         Some(inner_row) => {
                             for outer_row in outer_batch.iter().rev() {
-                                // Restore [original_left | original_right] column order.
                                 let merged = if self.inner_is_left {
                                     Row::merge(&inner_row, outer_row)
                                 } else {
