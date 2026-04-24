@@ -1,15 +1,17 @@
 use anyhow::{anyhow, Result};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate, Query, QueryOp, SortSpec};
+use common::Data;
 use db_config::DbContext;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
 use std::io::{BufRead, Write};
 
 use crate::buffer_manager::BufferManager;
 use crate::disk;
 use crate::filter;
 use crate::join;
-use crate::operator::{ExecContext, Operator};
+use crate::operator::{ExecContext, Operator, QueryMemoryManager};
 use crate::project;
 use crate::row::RowSchema;
 use crate::sort;
@@ -209,6 +211,7 @@ pub fn execute_query<RDisk, WDisk, WMon>(
     buffer_manager: &mut BufferManager,
     temp_storage: &mut TempStorageManager,
     sort_run_bytes: usize,
+    query_memory_budget_bytes: usize,
     stats_catalog: &StatsCatalog,
 ) -> Result<()>
 where
@@ -224,6 +227,7 @@ where
         buffer_manager,
         temp_storage,
         sort_run_bytes,
+        memory: QueryMemoryManager::new(query_memory_budget_bytes),
     };
 
     // monitor_out is a raw file-descriptor writer with no OS-level buffering.
@@ -251,14 +255,14 @@ where
 }
 
 fn execute_op_tree<'a>(
-    ctx: &DbContext,
+    ctx: &'a DbContext,
     op: &'a QueryOp,
     needed_above: Option<&HashSet<String>>,
-    stats_catalog: &StatsCatalog,
+    stats_catalog: &'a StatsCatalog,
 ) -> Result<Box<dyn Operator + 'a>> {
     match op {
         QueryOp::Scan(scan_data) => {
-            build_scan_operator(ctx, scan_data, needed_above, &[], stats_catalog)
+            build_scan_operator(ctx, scan_data, needed_above, &[], stats_catalog, None)
         }
         QueryOp::Filter(filter_data) => {
             if let QueryOp::Cross(cross_data) = filter_data.underlying.as_ref() {
@@ -323,6 +327,7 @@ fn build_scan_operator<'a>(
     needed_above: Option<&HashSet<String>>,
     scan_predicates: &[Predicate],
     stats_catalog: &StatsCatalog,
+    runtime_filter: Option<PlannedRuntimeMembershipFilter>,
 ) -> Result<Box<dyn Operator + 'a>> {
     let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
     let full_schema = disk::schema_from_table_spec(table_spec);
@@ -347,10 +352,10 @@ fn build_scan_operator<'a>(
             disk::ScanOperator::new(scan_data.table_id.clone(), pruned_schema)
                 .with_needed_columns(needed_indices, total_cols)
         } else {
-            disk::ScanOperator::new(scan_data.table_id.clone(), full_schema)
+            disk::ScanOperator::new(scan_data.table_id.clone(), full_schema.clone())
         }
     } else {
-        disk::ScanOperator::new(scan_data.table_id.clone(), full_schema)
+        disk::ScanOperator::new(scan_data.table_id.clone(), full_schema.clone())
     };
 
     if let Some(bounds) = ordered_scan_bounds_for_scan(
@@ -366,7 +371,456 @@ fn build_scan_operator<'a>(
         scan = scan.with_scan_filter_predicates(scan_predicates)?;
     }
 
+    if let Some(filter) = runtime_filter {
+        scan = scan.with_runtime_membership_filter(filter.instantiate_for_scan(&full_schema)?);
+    }
+
     Ok(Box::new(scan))
+}
+
+
+const RUNTIME_FILTER_BLOOM_BITS: usize = 65_536;
+const RUNTIME_FILTER_BLOOM_WORDS: usize = RUNTIME_FILTER_BLOOM_BITS / 64;
+const RUNTIME_FILTER_BLOOM_HASHES: usize = 4;
+const RUNTIME_FILTER_EXACT_BITMAP_MAX_BITS: usize = 4_194_304;
+const RUNTIME_FILTER_EXACT_BITMAP_MAX_VALUES: usize = 262_144;
+
+#[derive(Clone)]
+enum PlannedRuntimeMembershipFilterKind {
+    ExactIntBitmap {
+        base: i64,
+        bits: Vec<u64>,
+    },
+    Bloom {
+        words: Vec<u64>,
+        num_hashes: usize,
+    },
+}
+
+#[derive(Clone)]
+struct PlannedRuntimeMembershipFilter {
+    column_name: String,
+    kind: PlannedRuntimeMembershipFilterKind,
+    reserved_bytes: usize,
+}
+
+impl PlannedRuntimeMembershipFilter {
+    fn instantiate_for_scan(&self, full_schema: &RowSchema) -> Result<disk::RuntimeMembershipFilter> {
+        let full_col_idx = full_schema.require_index(&self.column_name)?;
+        match &self.kind {
+            PlannedRuntimeMembershipFilterKind::ExactIntBitmap { base, bits } => {
+                Ok(disk::RuntimeMembershipFilter::exact_int_bitmap(full_col_idx, *base, bits.clone()))
+            }
+            PlannedRuntimeMembershipFilterKind::Bloom { words, num_hashes } => {
+                disk::RuntimeMembershipFilter::bloom(full_col_idx, words.clone(), *num_hashes)
+            }
+        }
+    }
+
+    fn remap_through_project(&self, column_name_map: &[(String, String)]) -> Self {
+        let alias_to_source: HashMap<&str, &str> = column_name_map
+            .iter()
+            .map(|(source, alias)| (alias.as_str(), source.as_str()))
+            .collect();
+        let remapped_column = alias_to_source
+            .get(self.column_name.as_str())
+            .copied()
+            .unwrap_or(self.column_name.as_str())
+            .to_string();
+        Self {
+            column_name: remapped_column,
+            kind: self.kind.clone(),
+            reserved_bytes: self.reserved_bytes,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterHasher {
+    state: u64,
+}
+
+impl Hasher for RuntimeFilterHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = if self.state == 0 { FNV_OFFSET } else { self.state };
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        self.state = hash;
+    }
+
+    fn write_u8(&mut self, i: u8) { self.write(&[i]); }
+    fn write_u16(&mut self, i: u16) { self.write(&i.to_le_bytes()); }
+    fn write_u32(&mut self, i: u32) { self.write(&i.to_le_bytes()); }
+    fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()); }
+    fn write_usize(&mut self, i: usize) { self.write(&i.to_le_bytes()); }
+    fn write_i32(&mut self, i: i32) { self.write(&i.to_le_bytes()); }
+    fn write_i64(&mut self, i: i64) { self.write(&i.to_le_bytes()); }
+    fn finish(&self) -> u64 { self.state }
+}
+
+fn hash_data_for_runtime_filter(value: &Data) -> u64 {
+    let mut h = RuntimeFilterHasher::default();
+    match value {
+        Data::Int32(v) => h.write_i32(*v),
+        Data::Int64(v) => h.write_i64(*v),
+        Data::Float32(v) => h.write_u32(v.to_bits()),
+        Data::Float64(v) => h.write_u64(v.to_bits()),
+        Data::String(s) => h.write(s.as_bytes()),
+    }
+    h.finish()
+}
+
+fn add_hash_to_runtime_bloom(words: &mut [u64], hash: u64) {
+    let total_bits = words.len().saturating_mul(64);
+    if total_bits == 0 {
+        return;
+    }
+    let mut x = hash;
+    for _ in 0..RUNTIME_FILTER_BLOOM_HASHES {
+        let bit = (x as usize) % total_bits;
+        words[bit >> 6] |= 1u64 << (bit & 63);
+        x = x.rotate_left(17).wrapping_mul(0x9e3779b97f4a7c15);
+    }
+}
+
+fn build_runtime_filter_from_build<'a>(
+    ctx: &mut ExecContext,
+    build: &mut Box<dyn Operator + 'a>,
+    build_key_column: &str,
+    probe_key_column: &str,
+) -> Result<Option<PlannedRuntimeMembershipFilter>> {
+    let build_key_idx = build.schema().require_index(build_key_column)?;
+    let mut words = vec![0u64; RUNTIME_FILTER_BLOOM_WORDS];
+    let mut saw_any = false;
+
+    let mut supports_exact = true;
+    let mut exact_values: Vec<i64> = Vec::new();
+    let mut exact_min = 0i64;
+    let mut exact_max = 0i64;
+
+    while let Some(row) = build.next(ctx)? {
+        let value = row.require(build_key_idx)?;
+        add_hash_to_runtime_bloom(&mut words, hash_data_for_runtime_filter(value));
+        saw_any = true;
+
+        if supports_exact {
+            let int_value = match value {
+                Data::Int32(v) => *v as i64,
+                Data::Int64(v) => *v,
+                _ => {
+                    supports_exact = false;
+                    exact_values.clear();
+                    continue;
+                }
+            };
+
+            if exact_values.is_empty() {
+                exact_min = int_value;
+                exact_max = int_value;
+            } else {
+                exact_min = exact_min.min(int_value);
+                exact_max = exact_max.max(int_value);
+            }
+
+            if exact_values.len() >= RUNTIME_FILTER_EXACT_BITMAP_MAX_VALUES {
+                supports_exact = false;
+                exact_values.clear();
+                continue;
+            }
+
+            exact_values.push(int_value);
+        }
+    }
+
+    if !saw_any {
+        return Ok(None);
+    }
+
+    if supports_exact && !exact_values.is_empty() {
+        let span = ((exact_max as i128) - (exact_min as i128) + 1) as usize;
+        if span > 0 && span <= RUNTIME_FILTER_EXACT_BITMAP_MAX_BITS {
+            let bits_len = (span + 63) / 64;
+            let mut bits = vec![0u64; bits_len];
+            for value in exact_values {
+                let offset = (value - exact_min) as usize;
+                bits[offset >> 6] |= 1u64 << (offset & 63);
+            }
+
+            let reserved_bytes = bits.len().saturating_mul(std::mem::size_of::<u64>());
+            ctx.try_reserve_memory(reserved_bytes)?;
+
+            return Ok(Some(PlannedRuntimeMembershipFilter {
+                column_name: probe_key_column.to_string(),
+                kind: PlannedRuntimeMembershipFilterKind::ExactIntBitmap {
+                    base: exact_min,
+                    bits,
+                },
+                reserved_bytes,
+            }));
+        }
+    }
+
+    let reserved_bytes = words.len().saturating_mul(std::mem::size_of::<u64>());
+    ctx.try_reserve_memory(reserved_bytes)?;
+
+    Ok(Some(PlannedRuntimeMembershipFilter {
+        column_name: probe_key_column.to_string(),
+        kind: PlannedRuntimeMembershipFilterKind::Bloom {
+            words,
+            num_hashes: RUNTIME_FILTER_BLOOM_HASHES,
+        },
+        reserved_bytes,
+    }))
+}
+
+fn build_runtime_filtered_probe_leaf<'a>(
+    ctx: &'a DbContext,
+    op: &'a QueryOp,
+    local_predicates: &[Predicate],
+    needed_above: Option<&HashSet<String>>,
+    stats_catalog: &'a StatsCatalog,
+    runtime_filter: PlannedRuntimeMembershipFilter,
+) -> Result<Box<dyn Operator + 'a>> {
+    match op {
+        QueryOp::Scan(scan_data) => {
+            let needed = add_predicate_columns(needed_above, local_predicates);
+            build_scan_operator(
+                ctx,
+                scan_data,
+                needed.as_ref(),
+                local_predicates,
+                stats_catalog,
+                Some(runtime_filter),
+            )
+        }
+
+        QueryOp::Filter(filter_data) => {
+            let mut merged = filter_data.predicates.clone();
+            merged.extend_from_slice(local_predicates);
+            build_runtime_filtered_probe_leaf(
+                ctx,
+                &filter_data.underlying,
+                &merged,
+                needed_above,
+                stats_catalog,
+                runtime_filter,
+            )
+        }
+
+        QueryOp::Sort(sort_data) => {
+            let child_needed = add_sort_columns(needed_above, &sort_data.sort_specs);
+            let child = build_runtime_filtered_probe_leaf(
+                ctx,
+                &sort_data.underlying,
+                local_predicates,
+                child_needed.as_ref(),
+                stats_catalog,
+                runtime_filter,
+            )?;
+            Ok(Box::new(sort::SortOperator::new(child, &sort_data.sort_specs)?))
+        }
+
+        QueryOp::Project(project_data) => {
+            let remapped_needed = remap_needed_through_project(needed_above, &project_data.column_name_map);
+            let remapped_preds = remap_predicates_through_project(local_predicates, &project_data.column_name_map)?;
+            let remapped_filter = runtime_filter.remap_through_project(&project_data.column_name_map);
+            let child = build_runtime_filtered_probe_leaf(
+                ctx,
+                &project_data.underlying,
+                &remapped_preds,
+                remapped_needed.as_ref(),
+                stats_catalog,
+                remapped_filter,
+            )?;
+            Ok(Box::new(project::ProjectOperator::new(
+                child,
+                &project_data.column_name_map,
+            )?))
+        }
+
+        QueryOp::Cross(_) => {
+            let child_needed = add_predicate_columns(needed_above, local_predicates);
+            let child = execute_op_tree(ctx, op, child_needed.as_ref(), stats_catalog)?;
+            if local_predicates.is_empty() {
+                Ok(child)
+            } else {
+                Ok(Box::new(filter::FilterOperator::new(child, local_predicates)?))
+            }
+        }
+    }
+}
+
+enum RuntimeFilteredSemijoinState<'a> {
+    BuildThenProbe {
+        build: Box<dyn Operator + 'a>,
+    },
+    Probing {
+        probe: Box<dyn Operator + 'a>,
+    },
+    Done,
+}
+
+struct RuntimeFilteredSemijoinOperator<'a> {
+    ctx_db: &'a DbContext,
+    stats_catalog: &'a StatsCatalog,
+    schema: RowSchema,
+    build_key_column: String,
+    probe_key_column: String,
+    probe_op: &'a QueryOp,
+    probe_local_predicates: Vec<Predicate>,
+    probe_needed_above: Option<HashSet<String>>,
+    state: RuntimeFilteredSemijoinState<'a>,
+    reserved_filter_bytes: usize,
+}
+
+impl<'a> RuntimeFilteredSemijoinOperator<'a> {
+    fn new(
+        ctx_db: &'a DbContext,
+        stats_catalog: &'a StatsCatalog,
+        build: Box<dyn Operator + 'a>,
+        build_key_column: String,
+        probe_op: &'a QueryOp,
+        probe_local_predicates: Vec<Predicate>,
+        probe_needed_above: Option<HashSet<String>>,
+        probe_key_column: String,
+        schema: RowSchema,
+    ) -> Self {
+        Self {
+            ctx_db,
+            stats_catalog,
+            schema,
+            build_key_column,
+            probe_key_column,
+            probe_op,
+            probe_local_predicates,
+            probe_needed_above,
+            state: RuntimeFilteredSemijoinState::BuildThenProbe { build },
+            reserved_filter_bytes: 0,
+        }
+    }
+
+    fn prepare_probe(&mut self, ctx: &mut ExecContext) -> Result<()> {
+        let build = match std::mem::replace(&mut self.state, RuntimeFilteredSemijoinState::Done) {
+            RuntimeFilteredSemijoinState::BuildThenProbe { build } => build,
+            other => {
+                self.state = other;
+                return Ok(());
+            }
+        };
+        let mut build = build;
+        let runtime_filter = build_runtime_filter_from_build(
+            ctx,
+            &mut build,
+            &self.build_key_column,
+            &self.probe_key_column,
+        )?;
+        let Some(runtime_filter) = runtime_filter else {
+            self.state = RuntimeFilteredSemijoinState::Done;
+            return Ok(());
+        };
+        self.reserved_filter_bytes = runtime_filter.reserved_bytes;
+        let probe = match build_runtime_filtered_probe_leaf(
+            self.ctx_db,
+            self.probe_op,
+            &self.probe_local_predicates,
+            self.probe_needed_above.as_ref(),
+            self.stats_catalog,
+            runtime_filter,
+        ) {
+            Ok(probe) => probe,
+            Err(err) => {
+                if self.reserved_filter_bytes > 0 {
+                    ctx.release_memory(self.reserved_filter_bytes);
+                    self.reserved_filter_bytes = 0;
+                }
+                return Err(err);
+            }
+        };
+        self.state = RuntimeFilteredSemijoinState::Probing { probe };
+        Ok(())
+    }
+}
+
+impl<'a> Operator for RuntimeFilteredSemijoinOperator<'a> {
+    fn schema(&self) -> &RowSchema {
+        &self.schema
+    }
+
+    fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<crate::row::Row>> {
+        loop {
+            match &mut self.state {
+                RuntimeFilteredSemijoinState::BuildThenProbe { .. } => {
+                    self.prepare_probe(ctx)?;
+                }
+                RuntimeFilteredSemijoinState::Probing { probe } => {
+                    match probe.next(ctx)? {
+                        Some(row) => return Ok(Some(row)),
+                        None => {
+                            if self.reserved_filter_bytes > 0 {
+                                ctx.release_memory(self.reserved_filter_bytes);
+                                self.reserved_filter_bytes = 0;
+                            }
+                            self.state = RuntimeFilteredSemijoinState::Done;
+                            return Ok(None);
+                        }
+                    }
+                }
+                RuntimeFilteredSemijoinState::Done => return Ok(None),
+            }
+        }
+    }
+}
+
+fn runtime_filter_join_columns_for_keep_right(
+    leaf_idx: usize,
+    step_preds: &[&JoinPredicateInfo],
+) -> Option<(String, String)> {
+    if step_preds.len() != 1 {
+        return None;
+    }
+    let pred = step_preds[0];
+    if !pred.is_equi_column_join {
+        return None;
+    }
+    let ComparisionValue::Column(other_col) = &pred.predicate.value else {
+        return None;
+    };
+    if pred.left_leaf == leaf_idx {
+        Some((other_col.clone(), pred.predicate.column_name.clone()))
+    } else if pred.right_leaf == leaf_idx {
+        Some((pred.predicate.column_name.clone(), other_col.clone()))
+    } else {
+        None
+    }
+}
+
+fn try_build_runtime_filtered_semijoin_right<'a>(
+    ctx: &'a DbContext,
+    stats_catalog: &'a StatsCatalog,
+    build_plan: Box<dyn Operator + 'a>,
+    probe_op: &'a QueryOp,
+    probe_local_predicates: &[Predicate],
+    probe_needed_above: Option<&HashSet<String>>,
+    probe_schema: &RowSchema,
+    leaf_idx: usize,
+    step_preds: &[&JoinPredicateInfo],
+) -> Option<Box<dyn Operator + 'a>> {
+    let (build_key_column, probe_key_column) = runtime_filter_join_columns_for_keep_right(leaf_idx, step_preds)?;
+    Some(Box::new(RuntimeFilteredSemijoinOperator::new(
+        ctx,
+        stats_catalog,
+        build_plan,
+        build_key_column,
+        probe_op,
+        probe_local_predicates.to_vec(),
+        probe_needed_above.cloned(),
+        probe_key_column,
+        probe_schema.clone(),
+    )))
 }
 
 fn ordered_scan_bounds_for_scan(
@@ -519,11 +973,11 @@ fn tighter_upper(
 }
 
 fn try_build_flattened_spj_plan<'a>(
-    ctx: &DbContext,
+    ctx: &'a DbContext,
     cross_root: &'a common::query::CrossData,
     predicates: &[Predicate],
     needed_above: Option<&HashSet<String>>,
-    stats_catalog: &StatsCatalog,
+    stats_catalog: &'a StatsCatalog,
 ) -> Result<Option<Box<dyn Operator + 'a>>> {
     let mut leaf_ops = Vec::new();
     flatten_cross_inputs(&cross_root.left, &mut leaf_ops);
@@ -539,6 +993,7 @@ fn try_build_flattened_spj_plan<'a>(
             original_pos: idx,
             op: leaf_op,
             schema: logical_schema(ctx, leaf_op)?,
+            physical_width_bytes: physical_scan_width_bytes(ctx, leaf_op)?,
         });
     }
 
@@ -576,6 +1031,10 @@ fn try_build_flattened_spj_plan<'a>(
     // Running row-count estimate for the accumulated left-side plan.  Used to
     // give BNLJ a hint about which side to spill (the smaller one).
     let mut current_rows: f64 = 1.0;
+    // Columns in the current plan schema that are still known to be unique.
+    // We preserve this across semijoins because they only filter rows; a full
+    // join clears it because multiplicity may increase.
+    let mut current_unique_cols: HashSet<String> = HashSet::new();
 
     for &leaf_idx in &order {
         // Estimate rows for this leaf after applying its local predicates.
@@ -587,6 +1046,11 @@ fn try_build_flattened_spj_plan<'a>(
             stats_catalog,
         );
         let leaf_rows = (leaf_base * leaf_sel).max(1.0);
+        let leaf_unique_cols = unique_columns_for_plan_schema(
+            leaves[leaf_idx].op,
+            &leaves[leaf_idx].schema,
+            stats_catalog,
+        );
 
         let leaf_needed = needed_by_leaf.as_ref().map(|sets| &sets[leaf_idx]);
         let leaf_plan = execute_single_relation_leaf(
@@ -606,33 +1070,86 @@ fn try_build_flattened_spj_plan<'a>(
         } else {
             Vec::new()
         };
-
-        current_plan = Some(if let Some(left_plan) = current_plan {
-            // Pass row-count hints so BNLJ can pick the smaller side to spill.
-            join::build_join_hinted(left_plan, leaf_plan, &join_preds, current_rows, leaf_rows)?
+        let step_preds = if current_plan.is_some() {
+            step_join_predicates(current_mask, leaf_idx, &classification.join_predicates)
         } else {
-            leaf_plan
-        });
+            Vec::new()
+        };
 
-        // Update the accumulated row estimate for the next join step.
-        // Use the same density-based estimate that the DP optimizer used so
-        // that the BNLJ spill hint is consistent with the chosen plan.
-        if current_subset.is_empty() {
-            current_rows = leaf_rows;
-        } else {
-            let step_infos = step_join_predicates(current_mask, leaf_idx, &classification.join_predicates);
-            current_rows = estimate_join_rows(current_rows, leaf_rows, &step_infos, &leaves, stats_catalog);
-        }
-
-        current_subset.push(leaf_idx);
-        current_mask |= 1usize << leaf_idx;
+        let next_mask = current_mask | (1usize << leaf_idx);
         let keep_cols = compute_needed_columns_for_subset(
-            current_mask,
+            next_mask,
             &leaves,
             &classification.join_predicates,
             &classification.residual_predicates,
             needed_above,
         );
+
+        current_plan = Some(if let Some(left_plan) = current_plan {
+            let semijoin_keep_side = None;
+
+            let prev_current_rows = current_rows;
+            let join_rows_est = estimate_join_rows(
+                prev_current_rows,
+                leaf_rows,
+                &step_preds,
+                &leaves,
+                stats_catalog,
+            );
+
+            match semijoin_keep_side {
+                Some(join::SemijoinKeepSide::Left) => {
+                    current_rows = join_rows_est.min(prev_current_rows).max(1.0);
+                    join::build_semijoin_hinted(
+                        left_plan,
+                        leaf_plan,
+                        &join_preds,
+                        join::SemijoinKeepSide::Left,
+                        prev_current_rows,
+                        leaf_rows,
+                    )?
+                }
+                Some(join::SemijoinKeepSide::Right) => {
+                    current_rows = join_rows_est.min(leaf_rows).max(1.0);
+                    current_unique_cols = leaf_unique_cols.clone();
+                    if runtime_filter_join_columns_for_keep_right(leaf_idx, &step_preds).is_some() {
+                        try_build_runtime_filtered_semijoin_right(
+                            ctx,
+                            stats_catalog,
+                            left_plan,
+                            leaves[leaf_idx].op,
+                            &classification.local_predicates[leaf_idx],
+                            leaf_needed,
+                            leaf_plan.schema(),
+                            leaf_idx,
+                            &step_preds,
+                        ).expect("validated runtime-filter semijoin shape must build")
+                    } else {
+                        join::build_semijoin_hinted(
+                            left_plan,
+                            leaf_plan,
+                            &join_preds,
+                            join::SemijoinKeepSide::Right,
+                            prev_current_rows,
+                            leaf_rows,
+                        )?
+                    }
+                }
+                None => {
+                    current_rows = join_rows_est;
+                    current_unique_cols.clear();
+                    join::build_join_hinted(left_plan, leaf_plan, &join_preds, prev_current_rows, leaf_rows)?
+                }
+            }
+        } else {
+            current_rows = leaf_rows;
+            current_unique_cols = leaf_unique_cols.clone();
+            leaf_plan
+        });
+
+        current_subset.push(leaf_idx);
+        current_mask = next_mask;
+        current_unique_cols.retain(|col| keep_cols.contains(col));
         let plan = current_plan.take().expect("current plan must exist");
         current_plan = Some(trim_plan_to_needed(plan, &keep_cols)?);
     }
@@ -649,11 +1166,11 @@ fn try_build_flattened_spj_plan<'a>(
 }
 
 fn execute_single_relation_leaf<'a>(
-    ctx: &DbContext,
+    ctx: &'a DbContext,
     op: &'a QueryOp,
     local_predicates: &[Predicate],
     needed_above: Option<&HashSet<String>>,
-    stats_catalog: &StatsCatalog,
+    stats_catalog: &'a StatsCatalog,
 ) -> Result<Box<dyn Operator + 'a>> {
     match op {
         QueryOp::Scan(scan_data) => {
@@ -664,6 +1181,7 @@ fn execute_single_relation_leaf<'a>(
                 needed.as_ref(),
                 local_predicates,
                 stats_catalog,
+                None,
             )
         }
 
@@ -809,11 +1327,32 @@ fn logical_schema(ctx: &DbContext, op: &QueryOp) -> Result<RowSchema> {
     }
 }
 
+fn physical_scan_width_bytes(ctx: &DbContext, op: &QueryOp) -> Result<f64> {
+    match op {
+        QueryOp::Scan(scan_data) => {
+            let table_spec = disk::get_table_spec(ctx, &scan_data.table_id)?;
+            Ok(estimate_width_bytes(table_spec.column_specs.len().max(1)))
+        }
+        QueryOp::Filter(filter_data) => physical_scan_width_bytes(ctx, &filter_data.underlying),
+        QueryOp::Sort(sort_data) => physical_scan_width_bytes(ctx, &sort_data.underlying),
+        QueryOp::Project(project_data) => physical_scan_width_bytes(ctx, &project_data.underlying),
+        QueryOp::Cross(cross_data) => {
+            let left = physical_scan_width_bytes(ctx, &cross_data.left)?;
+            let right = physical_scan_width_bytes(ctx, &cross_data.right)?;
+            Ok(left + right - ROW_OVERHEAD_BYTES)
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SpjLeaf<'a> {
     original_pos: usize,
     op: &'a QueryOp,
     schema: RowSchema,
+    // Physical scan width of the underlying base table.  This is distinct from
+    // the logical/projected schema width because scans are still row-oriented:
+    // even with column pruning we must read full blocks off disk.
+    physical_width_bytes: f64,
 }
 
 #[derive(Clone)]
@@ -1046,6 +1585,137 @@ fn subset_contains_column<'a>(subset_mask: usize, leaves: &[SpjLeaf<'a>], column
     false
 }
 
+
+fn unique_columns_for_plan_schema(
+    op: &QueryOp,
+    schema: &RowSchema,
+    stats_catalog: &StatsCatalog,
+) -> HashSet<String> {
+    schema
+        .column_names()
+        .iter()
+        .filter(|col| {
+            resolve_column_in_leaf(op, col)
+                .map(|(table_id, base_col)| is_unique_column_on_table(stats_catalog, &table_id, &base_col))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn is_unique_column_on_table(
+    stats_catalog: &StatsCatalog,
+    table_id: &str,
+    column_name: &str,
+) -> bool {
+    let Some(row_count) = stats_catalog.row_count(table_id) else {
+        return false;
+    };
+    let Some(col_stats) = stats_catalog.column(table_id, column_name) else {
+        return false;
+    };
+
+    if let Some(cardinality_rows) = col_stats.cardinality_rows {
+        if cardinality_rows >= row_count * 0.999 {
+            return true;
+        }
+    }
+
+    if let Some(density) = col_stats.density {
+        if density >= 0.999 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn join_column_name_for_leaf<'a>(
+    info: &JoinPredicateInfo,
+    target_leaf: usize,
+    leaves: &[SpjLeaf<'a>],
+) -> Option<String> {
+    let left_name = info.predicate.column_name.as_str();
+    let right_name = match &info.predicate.value {
+        ComparisionValue::Column(c) => c.as_str(),
+        _ => return None,
+    };
+    let schema = &leaves[target_leaf].schema;
+
+    let has_left = schema.contains(left_name);
+    let has_right = schema.contains(right_name);
+    match (has_left, has_right) {
+        (true, false) => Some(left_name.to_string()),
+        (false, true) => Some(right_name.to_string()),
+        _ => None,
+    }
+}
+
+fn choose_semijoin_keep_side<'a>(
+    current_mask: usize,
+    leaf_idx: usize,
+    leaves: &[SpjLeaf<'a>],
+    step_preds: &[&JoinPredicateInfo],
+    keep_cols: &HashSet<String>,
+    current_unique_cols: &HashSet<String>,
+    stats_catalog: &StatsCatalog,
+) -> Option<join::SemijoinKeepSide> {
+    if step_preds.is_empty() || step_preds.iter().any(|info| !info.is_equi_column_join) {
+        return None;
+    }
+
+    let need_current = keep_cols
+        .iter()
+        .any(|col| subset_contains_column(current_mask, leaves, col));
+    let need_leaf = keep_cols
+        .iter()
+        .any(|col| leaves[leaf_idx].schema.contains(col));
+
+    if need_current == need_leaf {
+        return None;
+    }
+
+    if need_current {
+        let mut leaf_join_cols: HashSet<String> = HashSet::new();
+        for info in step_preds {
+            leaf_join_cols.insert(join_column_name_for_leaf(info, leaf_idx, leaves)?);
+        }
+        if leaf_join_cols.len() != 1 {
+            return None;
+        }
+        let only_col = leaf_join_cols.into_iter().next()?;
+        let (table_id, base_col) = resolve_column_in_leaf(leaves[leaf_idx].op, &only_col)?;
+        if is_unique_column_on_table(stats_catalog, &table_id, &base_col) {
+            Some(join::SemijoinKeepSide::Left)
+        } else {
+            None
+        }
+    } else {
+        let mut current_join_cols: HashSet<String> = HashSet::new();
+        for info in step_preds {
+            let left_name = join_column_name_for_leaf(info, info.left_leaf, leaves);
+            let right_name = join_column_name_for_leaf(info, info.right_leaf, leaves);
+            let current_col = if (current_mask & (1usize << info.left_leaf)) != 0 && info.left_leaf != leaf_idx {
+                left_name
+            } else if (current_mask & (1usize << info.right_leaf)) != 0 && info.right_leaf != leaf_idx {
+                right_name
+            } else {
+                None
+            }?;
+            current_join_cols.insert(current_col);
+        }
+        if current_join_cols.len() != 1 {
+            return None;
+        }
+        let only_col = current_join_cols.into_iter().next()?;
+        if current_unique_cols.contains(&only_col) {
+            Some(join::SemijoinKeepSide::Right)
+        } else {
+            None
+        }
+    }
+}
+
 fn trim_plan_to_needed<'a>(
     plan: Box<dyn Operator + 'a>,
     needed: &HashSet<String>,
@@ -1214,41 +1884,51 @@ fn estimate_leaf_access_stats<'a>(
     stats_catalog: &StatsCatalog,
 ) -> PlanStats {
     let width_bytes = subset_width_bytes;
-    let base_rows = estimate_base_rows_for_leaf(leaves[leaf_idx].op, stats_catalog).unwrap_or(DEFAULT_BASE_REL_ROWS);
-    let selectivity = estimate_local_selectivity_for_leaf(leaves[leaf_idx].op, &local_predicates[leaf_idx], stats_catalog);
+    let base_rows = estimate_base_rows_for_leaf(leaves[leaf_idx].op, stats_catalog)
+        .unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let selectivity = estimate_local_selectivity_for_leaf(
+        leaves[leaf_idx].op,
+        &local_predicates[leaf_idx],
+        stats_catalog,
+    );
     let rows = (base_rows * selectivity).max(1.0);
 
-    // If a range predicate targets a physically-ordered column we can skip
-    // blocks that fall outside the predicate range.  Model this by scaling the
-    // page estimate by the fraction of blocks we actually need to read (the
-    // range selectivity).  This gives the join-order optimizer a realistic
-    // picture of how cheap such a scan really is.
+    // Distinguish between:
+    //   * scan pages  = disk I/O needed to read the base table
+    //   * output pages = size of the filtered rows flowing into the join tree
+    //
+    // Query 52 was getting misplanned because unordered equality predicates
+    // such as `p_size = 15` and `r_name = 'EUROPE'` made those leaves look
+    // artificially cheap: we were charging only for the filtered output pages
+    // even though the scan still has to read the full row-oriented file.
     let scan_fraction = ordered_scan_fraction(
         leaves[leaf_idx].op,
         &local_predicates[leaf_idx],
         stats_catalog,
     );
-    let pages = (estimate_pages(rows, width_bytes) * scan_fraction).max(1.0);
+    let scan_pages = (
+        estimate_pages(base_rows, leaves[leaf_idx].physical_width_bytes) * scan_fraction
+    )
+        .max(1.0);
+    let output_pages = estimate_pages(rows, width_bytes).max(1.0);
 
-    let _ = (leaves, needed_by_leaf); // width already comes from subset_width_bytes.
+    let _ = needed_by_leaf; // output width already comes from subset_width_bytes.
 
     PlanStats {
         rows,
         width_bytes,
-        pages,
-        cost: pages,
+        pages: output_pages,
+        cost: scan_pages,
     }
 }
 
-/// Returns the fraction of blocks that must be read when one or more range
-/// predicates target a physically-ordered column.  Returns 1.0 (full scan)
+/// Returns the fraction of blocks that must be read when one or more
+/// predicates target a physically-ordered column. Returns 1.0 (full scan)
 /// when no such predicate exists.
 ///
-/// When `IsPhysicallyOrdered` is true the data is stored sorted on that
-/// column, so a range predicate `col > X` only needs to touch the tail of the
-/// file rather than every block.  We use the range selectivity (derived from
-/// `RangeStat`) as a proxy for this fraction.  The minimum over all ordered
-/// range predicates is used when several such predicates are present.
+/// Equality predicates are included too: the runtime can already convert
+/// `col = X` into an ordered [X, X] bound, so the optimizer should also treat
+/// that as a short ordered scan rather than a full-table read.
 fn ordered_scan_fraction(
     op: &QueryOp,
     predicates: &[Predicate],
@@ -1258,6 +1938,9 @@ fn ordered_scan_fraction(
         Some(id) => id,
         None => return 1.0,
     };
+    let row_count = stats_catalog
+        .row_count(table_id)
+        .unwrap_or(DEFAULT_BASE_REL_ROWS);
 
     let mut best: f64 = 1.0;
     for pred in predicates {
@@ -1268,18 +1951,17 @@ fn ordered_scan_fraction(
         if col_stats.is_physically_ordered != Some(true) {
             continue;
         }
-        let is_range = matches!(
-            pred.operator,
+
+        let frac = match pred.operator {
+            ComparisionOperator::EQ => estimate_eq_literal_selectivity(Some(col_stats), row_count),
             ComparisionOperator::GT
-                | ComparisionOperator::GTE
-                | ComparisionOperator::LT
-                | ComparisionOperator::LTE
-        );
-        if !is_range {
-            continue;
-        }
-        let frac = estimate_range_selectivity(Some(col_stats), pred)
-            .unwrap_or(RANGE_PRED_SELECTIVITY);
+            | ComparisionOperator::GTE
+            | ComparisionOperator::LT
+            | ComparisionOperator::LTE => estimate_range_selectivity(Some(col_stats), pred)
+                .unwrap_or(RANGE_PRED_SELECTIVITY),
+            ComparisionOperator::NE => continue,
+        };
+
         if frac < best {
             best = frac;
         }
@@ -1321,19 +2003,7 @@ fn estimate_join_step<'a>(
     let join_work = if has_equi {
         left.pages + right.pages + output_pages
     } else {
-        // BNLJ: the smaller side is spilled once (inner) and the larger side is
-        // loaded in batches (outer).  Each outer batch re-scans the full inner.
-        //   cost = inner_spill + outer_read + num_passes * inner_read + output
-        // where num_passes = ceil(outer.pages / batch_size).
-        // This is far cheaper than the naive left.pages * right.pages estimate
-        // because the outer side is processed in large memory-sized chunks.
-        let (inner_pages, outer_pages) = if left.pages <= right.pages {
-            (left.pages, right.pages)
-        } else {
-            (right.pages, left.pages)
-        };
-        let num_passes = (outer_pages / BNLJ_COST_BATCH_PAGES).ceil().max(1.0);
-        inner_pages + outer_pages + num_passes * inner_pages + output_pages
+        left.pages + (left.pages * right.pages) + output_pages
     };
 
     let _ = right_original_pos; // unused after tie_break removal
@@ -1570,36 +2240,21 @@ fn estimate_equi_join_selectivity<'a>(
     leaves: &[SpjLeaf<'a>],
     stats_catalog: &StatsCatalog,
 ) -> Option<f64> {
-    // `info.left_leaf` / `info.right_leaf` are sorted by leaf index (smaller,
-    // larger) and do NOT necessarily correspond to the two sides of the
-    // predicate.  `predicate.column_name` may belong to *either* leaf, so we
-    // consult the schemas to find the correct owner before resolving.
-    let pred_col_leaf = if leaves[info.left_leaf].schema.contains(&info.predicate.column_name) {
-        info.left_leaf
-    } else {
-        info.right_leaf
-    };
-    let other_col_leaf = if pred_col_leaf == info.left_leaf {
-        info.right_leaf
-    } else {
-        info.left_leaf
-    };
-
-    let pred_col = resolve_column_in_leaf(leaves[pred_col_leaf].op, &info.predicate.column_name)?;
+    let left_col = resolve_column_in_leaf(leaves[info.left_leaf].op, &info.predicate.column_name)?;
     let right_name = match &info.predicate.value {
         ComparisionValue::Column(c) => c.as_str(),
         _ => return None,
     };
-    let other_col = resolve_column_in_leaf(leaves[other_col_leaf].op, right_name)?;
+    let right_col = resolve_column_in_leaf(leaves[info.right_leaf].op, right_name)?;
 
-    let pred_rows = stats_catalog.row_count(&pred_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
-    let other_rows = stats_catalog.row_count(&other_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
-    let pred_density = stats_catalog.column(&pred_col.0, &pred_col.1)?.density?;
-    let other_density = stats_catalog.column(&other_col.0, &other_col.1)?.density?;
+    let left_rows = stats_catalog.row_count(&left_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let right_rows = stats_catalog.row_count(&right_col.0).unwrap_or(DEFAULT_BASE_REL_ROWS);
+    let left_density = stats_catalog.column(&left_col.0, &left_col.1)?.density?;
+    let right_density = stats_catalog.column(&right_col.0, &right_col.1)?.density?;
 
-    let pred_ndv = (pred_rows * pred_density).max(1.0);
-    let other_ndv = (other_rows * other_density).max(1.0);
-    Some((1.0 / pred_ndv.max(other_ndv)).clamp(MIN_SELECTIVITY, 1.0_f64))
+    let left_ndv = (left_rows * left_density).max(1.0);
+    let right_ndv = (right_rows * right_density).max(1.0);
+    Some((1.0 / left_ndv.max(right_ndv)).clamp(MIN_SELECTIVITY, 1.0_f64))
 }
 
 fn resolve_column_in_leaf(op: &QueryOp, column_name: &str) -> Option<(String, String)> {
@@ -1638,10 +2293,6 @@ const NE_PRED_SELECTIVITY: f64 = 0.90;
 const RANGE_PRED_SELECTIVITY: f64 = 0.33;
 const EQ_JOIN_SELECTIVITY: f64 = 0.001;
 const OTHER_JOIN_SELECTIVITY: f64 = 0.10;
-// Expected BNLJ outer-batch size (pages) used for cost estimation.  Matches
-// MAX_BNLJ_OUTER_BATCH_PAGES in join.rs so the cost model reflects the actual
-// execution behaviour after the batch-size increase.
-const BNLJ_COST_BATCH_PAGES: f64 = 512.0;
 
 fn add_predicate_columns(
     needed: Option<&HashSet<String>>,

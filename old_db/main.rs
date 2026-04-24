@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::Query;
 use db_config::DbContext;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 
 use crate::{
@@ -25,53 +24,6 @@ mod sort;
 mod operator;
 mod temp_storage;
 mod io_setup;
-
-#[derive(Debug, Default)]
-struct ProcMemStatus {
-    vm_peak_kb: Option<u64>,
-    vm_size_kb: Option<u64>,
-    vm_hwm_kb: Option<u64>,
-    vm_rss_kb: Option<u64>,
-}
-
-fn parse_status_kb(line: &str, key: &str) -> Option<u64> {
-    if !line.starts_with(key) {
-        return None;
-    }
-
-    let mut parts = line.split_whitespace();
-    let _label = parts.next()?;
-    let value = parts.next()?.parse::<u64>().ok()?;
-    Some(value)
-}
-
-fn read_proc_mem_status() -> Result<ProcMemStatus> {
-    let text = fs::read_to_string("/proc/self/status")
-        .context("failed to read /proc/self/status")?;
-
-    let mut out = ProcMemStatus::default();
-
-    for line in text.lines() {
-        if out.vm_peak_kb.is_none() {
-            out.vm_peak_kb = parse_status_kb(line, "VmPeak:");
-        }
-        if out.vm_size_kb.is_none() {
-            out.vm_size_kb = parse_status_kb(line, "VmSize:");
-        }
-        if out.vm_hwm_kb.is_none() {
-            out.vm_hwm_kb = parse_status_kb(line, "VmHWM:");
-        }
-        if out.vm_rss_kb.is_none() {
-            out.vm_rss_kb = parse_status_kb(line, "VmRSS:");
-        }
-    }
-
-    Ok(out)
-}
-
-fn fmt_opt_u64(v: Option<u64>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_default()
-}
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -97,15 +49,24 @@ fn db_main() -> Result<()> {
     monitor_buf_reader.read_line(&mut input_line)?;
     let memory_limit_mb: u32 = input_line.trim().parse()?;
     eprintln!("Memory limit is set to {} MB", memory_limit_mb);
-
     let block_size = disk::get_block_size(&mut disk_buf_reader, &mut disk_out)?;
+
     let memory_limit_bytes = (memory_limit_mb as usize) * 1024 * 1024;
 
     let capacity = 2;
     let mut buffer_manager = BufferManager::new(block_size, capacity)?;
 
-    let usable_for_sort = memory_limit_bytes.saturating_sub(capacity * block_size);
-    let sort_run_bytes = std::cmp::max(block_size, (usable_for_sort * 4) / 5);
+    let fixed_buffer_bytes = capacity * block_size;
+    let safety_slack_bytes = ((memory_limit_bytes / 16).max(2 * 1024 * 1024)).min(8 * 1024 * 1024);
+    let query_memory_budget_bytes = memory_limit_bytes
+        .saturating_sub(fixed_buffer_bytes)
+        .saturating_sub(safety_slack_bytes)
+        .max(block_size);
+
+    // Keep the historical per-operator heuristic budget for run sizing and join
+    // partition sizing, but let the real reservation manager use the larger
+    // query-wide budget above.
+    let sort_run_bytes = std::cmp::max(block_size, query_memory_budget_bytes * 3/5);
     let mut temp_storage = TempStorageManager::new(block_size)?;
 
     executor::execute_query(
@@ -117,17 +78,9 @@ fn db_main() -> Result<()> {
         &mut buffer_manager,
         &mut temp_storage,
         sort_run_bytes,
+        query_memory_budget_bytes,
         &stats_catalog,
     )?;
-
-    let mem = read_proc_mem_status()?;
-    eprintln!(
-        "DB_MEM_METRICS,vm_peak_kb={},vm_size_kb={},vm_hwm_kb={},vm_rss_kb={}",
-        fmt_opt_u64(mem.vm_peak_kb),
-        fmt_opt_u64(mem.vm_size_kb),
-        fmt_opt_u64(mem.vm_hwm_kb),
-        fmt_opt_u64(mem.vm_rss_kb),
-    );
 
     Ok(())
 }

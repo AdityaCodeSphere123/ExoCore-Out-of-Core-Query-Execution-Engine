@@ -4,6 +4,8 @@ use db_config::table::TableSpec;
 use db_config::DbContext;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::hash::Hasher;
+use std::mem::size_of;
 use std::io::{BufRead, Write};
 
 use crate::buffer::BlockBuffer;
@@ -11,7 +13,7 @@ use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
 use crate::operator::Operator;
 use crate::row::{Row, RowSchema};
 
-const SCAN_PREFETCH_BLOCKS: usize = 128;
+const SCAN_PREFETCH_BLOCKS: usize = 32;
 
 pub fn get_table_spec<'a>(ctx: &'a DbContext, table_id: &str) -> Result<&'a TableSpec> {
     ctx.get_table_specs()
@@ -43,6 +45,134 @@ pub struct OrderedScanBounds {
     pub upper: Option<ScanBound>,
 }
 
+
+#[derive(Debug, Clone)]
+pub enum RuntimeMembershipFilterKind {
+    ExactIntBitmap {
+        base: i64,
+        bits: Vec<u64>,
+    },
+    Bloom {
+        words: Vec<u64>,
+        num_hashes: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeMembershipFilter {
+    pub full_col_idx: usize,
+    pub kind: RuntimeMembershipFilterKind,
+}
+
+impl RuntimeMembershipFilter {
+    pub fn exact_int_bitmap(full_col_idx: usize, base: i64, bits: Vec<u64>) -> Self {
+        Self {
+            full_col_idx,
+            kind: RuntimeMembershipFilterKind::ExactIntBitmap { base, bits },
+        }
+    }
+
+    pub fn bloom(full_col_idx: usize, words: Vec<u64>, num_hashes: usize) -> Result<Self> {
+        if words.is_empty() {
+            return Err(anyhow!("runtime bloom filter must have at least one word"));
+        }
+        if num_hashes == 0 {
+            return Err(anyhow!("runtime bloom filter must use at least one hash"));
+        }
+        Ok(Self {
+            full_col_idx,
+            kind: RuntimeMembershipFilterKind::Bloom { words, num_hashes },
+        })
+    }
+
+    pub fn matches_data(&self, value: &Data) -> bool {
+        match &self.kind {
+            RuntimeMembershipFilterKind::ExactIntBitmap { base, bits } => {
+                match value {
+                    Data::Int32(v) => bitmap_contains(*base, bits, *v as i64),
+                    Data::Int64(v) => bitmap_contains(*base, bits, *v),
+                    _ => false,
+                }
+            }
+            RuntimeMembershipFilterKind::Bloom { words, num_hashes } => {
+                bloom_might_contain(words, *num_hashes, hash_data_value(value))
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct FastHasher {
+    state: u64,
+}
+
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = if self.state == 0 { FNV_OFFSET } else { self.state };
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        self.state = hash;
+    }
+
+    fn write_u8(&mut self, i: u8) { self.write(&[i]); }
+    fn write_u16(&mut self, i: u16) { self.write(&i.to_le_bytes()); }
+    fn write_u32(&mut self, i: u32) { self.write(&i.to_le_bytes()); }
+    fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()); }
+    fn write_usize(&mut self, i: usize) { self.write(&i.to_le_bytes()); }
+    fn write_i32(&mut self, i: i32) { self.write(&i.to_le_bytes()); }
+    fn write_i64(&mut self, i: i64) { self.write(&i.to_le_bytes()); }
+    fn finish(&self) -> u64 { self.state }
+}
+
+fn bitmap_contains(base: i64, bits: &[u64], value: i64) -> bool {
+    if value < base {
+        return false;
+    }
+    let offset = (value - base) as usize;
+    let bit_cap = bits.len().saturating_mul(64);
+    if offset >= bit_cap {
+        return false;
+    }
+    (bits[offset >> 6] & (1u64 << (offset & 63))) != 0
+}
+
+fn bloom_might_contain(words: &[u64], num_hashes: usize, hash: u64) -> bool {
+    let total_bits = words.len().saturating_mul(64);
+    if total_bits == 0 {
+        return false;
+    }
+    let mut x = hash;
+    for _ in 0..num_hashes {
+        let bit = (x as usize) % total_bits;
+        if (words[bit >> 6] & (1u64 << (bit & 63))) == 0 {
+            return false;
+        }
+        x = x.rotate_left(17).wrapping_mul(0x9e3779b97f4a7c15);
+    }
+    true
+}
+
+fn hash_data_value(value: &Data) -> u64 {
+    let mut h = FastHasher::default();
+    match value {
+        Data::Int32(v) => h.write_i32(*v),
+        Data::Int64(v) => h.write_i64(*v),
+        Data::Float32(v) => h.write_u32(v.to_bits()),
+        Data::Float64(v) => h.write_u64(v.to_bits()),
+        Data::String(s) => h.write(s.as_bytes()),
+    }
+    h.finish()
+}
+
+struct BufferedRowBatch {
+    rows: std::vec::IntoIter<Row>,
+    reserved_bytes: usize,
+}
+
 pub struct ScanOperator {
     table_id: String,
     schema: RowSchema,
@@ -53,11 +183,12 @@ pub struct ScanOperator {
     /// that fail never enter the higher operator pipeline.
     scan_filter: Vec<ResolvedPredicate>,
     ordered_bounds: Option<OrderedScanBounds>,
+    runtime_membership_filter: Option<RuntimeMembershipFilter>,
     start_block: Option<u64>,
     num_blocks: Option<u64>,
     current_block_offset: u64,
-    current_rows: Option<std::vec::IntoIter<Row>>,
-    prefetched_rows: VecDeque<std::vec::IntoIter<Row>>,
+    current_rows: Option<BufferedRowBatch>,
+    prefetched_rows: VecDeque<BufferedRowBatch>,
 }
 
 impl ScanOperator {
@@ -68,6 +199,7 @@ impl ScanOperator {
             keep_columns: Vec::new(),
             scan_filter: Vec::new(),
             ordered_bounds: None,
+            runtime_membership_filter: None,
             start_block: None,
             num_blocks: None,
             current_block_offset: 0,
@@ -93,6 +225,16 @@ impl ScanOperator {
     pub fn with_ordered_bounds(mut self, bounds: OrderedScanBounds) -> Self {
         self.ordered_bounds = Some(bounds);
         self
+    }
+
+    pub fn with_runtime_membership_filter(mut self, filter: RuntimeMembershipFilter) -> Self {
+        self.runtime_membership_filter = Some(filter);
+        self
+    }
+
+    fn estimate_buffered_batch_bytes(rows: &[Row]) -> usize {
+        rows.iter().map(Row::estimate_heap_size).sum::<usize>()
+            + rows.len().saturating_mul(size_of::<Row>())
     }
 
     fn refill_prefetch_buffer(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<bool> {
@@ -134,8 +276,9 @@ impl ScanOperator {
         }
 
         let remaining_blocks = (num_blocks - self.current_block_offset) as usize;
-        let batch_blocks = remaining_blocks.min(SCAN_PREFETCH_BLOCKS);
         let block_size = ctx.buffer_manager.block_size();
+        let memory_limited_blocks = (ctx.available_memory() / (block_size.max(1) * 2)).max(1);
+        let batch_blocks = remaining_blocks.min(SCAN_PREFETCH_BLOCKS).min(memory_limited_blocks);
         let batch_start_block = start_block + self.current_block_offset;
 
         let batch_buf = get_blocks(
@@ -155,17 +298,35 @@ impl ScanOperator {
         for block_idx in 0..batch_blocks {
             let start = block_idx * block_size;
             let end = start + block_size;
-            let block_rows = if self.scan_filter.is_empty() {
-                decode_block_into_rows(table_spec, &batch_buf[start..end], keep)?
-            } else {
-                decode_block_into_rows_filtered(
+            let block_rows = match (&self.runtime_membership_filter, self.scan_filter.is_empty()) {
+                (Some(runtime_filter), true) => decode_block_into_rows_runtime_filtered(
+                    table_spec,
+                    &batch_buf[start..end],
+                    keep,
+                    runtime_filter,
+                    None,
+                )?,
+                (Some(runtime_filter), false) => decode_block_into_rows_runtime_filtered(
+                    table_spec,
+                    &batch_buf[start..end],
+                    keep,
+                    runtime_filter,
+                    Some(&self.scan_filter),
+                )?,
+                (None, true) => decode_block_into_rows(table_spec, &batch_buf[start..end], keep)?,
+                (None, false) => decode_block_into_rows_filtered(
                     table_spec,
                     &batch_buf[start..end],
                     keep,
                     &self.scan_filter,
-                )?
+                )?,
             };
-            self.prefetched_rows.push_back(block_rows.into_iter());
+            let reserved_bytes = Self::estimate_buffered_batch_bytes(&block_rows);
+            ctx.try_reserve_memory(reserved_bytes)?;
+            self.prefetched_rows.push_back(BufferedRowBatch {
+                rows: block_rows.into_iter(),
+                reserved_bytes,
+            });
         }
 
         self.current_block_offset += batch_blocks as u64;
@@ -180,15 +341,17 @@ impl Operator for ScanOperator {
 
     fn next(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<Option<Row>> {
         loop {
-            if let Some(rows) = &mut self.current_rows {
-                if let Some(row) = rows.next() {
+            if let Some(batch) = &mut self.current_rows {
+                if let Some(row) = batch.rows.next() {
                     return Ok(Some(row));
                 }
+                let released = batch.reserved_bytes;
                 self.current_rows = None;
+                ctx.release_memory(released);
             }
 
-            if let Some(rows) = self.prefetched_rows.pop_front() {
-                self.current_rows = Some(rows);
+            if let Some(batch) = self.prefetched_rows.pop_front() {
+                self.current_rows = Some(batch);
                 continue;
             }
 
@@ -276,7 +439,7 @@ pub fn decode_block_into_rows(
     block: &[u8],
     keep: Option<&[bool]>,
 ) -> Result<Vec<Row>> {
-    decode_block_into_rows_maybe_filtered(table_spec, block, keep, None)
+    decode_block_into_rows_maybe_filtered(table_spec, block, keep, None, None)
 }
 
 pub fn decode_block_into_rows_filtered(
@@ -285,55 +448,23 @@ pub fn decode_block_into_rows_filtered(
     keep: Option<&[bool]>,
     scan_filter: &[ResolvedPredicate],
 ) -> Result<Vec<Row>> {
-    decode_block_into_rows_maybe_filtered(table_spec, block, keep, Some(scan_filter))
+    decode_block_into_rows_maybe_filtered(table_spec, block, keep, Some(scan_filter), None)
 }
 
-fn decode_block_into_rows_maybe_filtered(
+pub fn decode_block_into_rows_runtime_filtered(
     table_spec: &TableSpec,
     block: &[u8],
     keep: Option<&[bool]>,
+    runtime_filter: &RuntimeMembershipFilter,
     scan_filter: Option<&[ResolvedPredicate]>,
 ) -> Result<Vec<Row>> {
-    let buf = BlockBuffer::new(block);
-    let row_count = buf.row_count()?;
-    let mut offset = 0usize;
-
-    let num_kept = keep
-        .map(|k| k.iter().filter(|&&v| v).count())
-        .unwrap_or(table_spec.column_specs.len());
-    let mut rows = Vec::with_capacity(row_count);
-
-    // Build the decode plan once outside the row loop.
-    let plan = build_col_decode_plan(table_spec, keep);
-
-    for _ in 0..row_count {
-        let mut values = Vec::with_capacity(num_kept);
-
-        for &op in &plan {
-            match op {
-                ColDecodeOp::KeepI32 => values.push(Data::Int32(buf.read_i32(&mut offset)?)),
-                ColDecodeOp::KeepI64 => values.push(Data::Int64(buf.read_i64(&mut offset)?)),
-                ColDecodeOp::KeepF32 => values.push(Data::Float32(buf.read_f32(&mut offset)?)),
-                ColDecodeOp::KeepF64 => values.push(Data::Float64(buf.read_f64(&mut offset)?)),
-                ColDecodeOp::KeepStr => values.push(Data::String(buf.read_cstring(&mut offset)?)),
-                ColDecodeOp::SkipFixed(n) => {
-                    buf.ensure_bytes(offset, n)?;
-                    offset += n;
-                }
-                ColDecodeOp::SkipStr => buf.skip_cstring(&mut offset)?,
-            }
-        }
-
-        let row = Row::new(values);
-        if let Some(preds) = scan_filter {
-            if !eval_resolved(&row, preds)? {
-                continue;
-            }
-        }
-        rows.push(row);
-    }
-
-    Ok(rows)
+    decode_block_into_rows_maybe_filtered(
+        table_spec,
+        block,
+        keep,
+        scan_filter,
+        Some(runtime_filter),
+    )
 }
 
 /// A pre-compiled per-column decode action.  Built once before the row loop so
@@ -390,6 +521,215 @@ fn build_col_decode_plan(table_spec: &TableSpec, keep: Option<&[bool]>) -> Vec<C
         plan.push(ColDecodeOp::SkipFixed(pending_skip_bytes));
     }
     plan
+}
+
+fn decode_block_into_rows_maybe_filtered(
+    table_spec: &TableSpec,
+    block: &[u8],
+    keep: Option<&[bool]>,
+    scan_filter: Option<&[ResolvedPredicate]>,
+    runtime_filter: Option<&RuntimeMembershipFilter>,
+) -> Result<Vec<Row>> {
+    if let Some(runtime_filter) = runtime_filter {
+        return decode_block_into_rows_with_runtime_filter(
+            table_spec,
+            block,
+            keep,
+            scan_filter,
+            runtime_filter,
+        );
+    }
+
+    let buf = BlockBuffer::new(block);
+    let row_count = buf.row_count()?;
+    let mut offset = 0usize;
+
+    let num_kept = keep
+        .map(|k| k.iter().filter(|&&v| v).count())
+        .unwrap_or(table_spec.column_specs.len());
+    let mut rows = Vec::with_capacity(row_count);
+
+    // Build the decode plan once outside the row loop.
+    let plan = build_col_decode_plan(table_spec, keep);
+
+    for _ in 0..row_count {
+        let mut values = Vec::with_capacity(num_kept);
+
+        for &op in &plan {
+            match op {
+                ColDecodeOp::KeepI32 => values.push(Data::Int32(buf.read_i32(&mut offset)?)),
+                ColDecodeOp::KeepI64 => values.push(Data::Int64(buf.read_i64(&mut offset)?)),
+                ColDecodeOp::KeepF32 => values.push(Data::Float32(buf.read_f32(&mut offset)?)),
+                ColDecodeOp::KeepF64 => values.push(Data::Float64(buf.read_f64(&mut offset)?)),
+                ColDecodeOp::KeepStr => values.push(Data::String(buf.read_cstring(&mut offset)?)),
+                ColDecodeOp::SkipFixed(n) => {
+                    buf.ensure_bytes(offset, n)?;
+                    offset += n;
+                }
+                ColDecodeOp::SkipStr => buf.skip_cstring(&mut offset)?,
+            }
+        }
+
+        let row = Row::new(values);
+        if let Some(preds) = scan_filter {
+            if !eval_resolved(&row, preds)? {
+                continue;
+            }
+        }
+        rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+fn decode_block_into_rows_with_runtime_filter(
+    table_spec: &TableSpec,
+    block: &[u8],
+    keep: Option<&[bool]>,
+    scan_filter: Option<&[ResolvedPredicate]>,
+    runtime_filter: &RuntimeMembershipFilter,
+) -> Result<Vec<Row>> {
+    let buf = BlockBuffer::new(block);
+    let row_count = buf.row_count()?;
+    let mut offset = 0usize;
+
+    let num_kept = keep
+        .map(|k| k.iter().filter(|&&v| v).count())
+        .unwrap_or(table_spec.column_specs.len());
+    let mut rows = Vec::with_capacity(row_count);
+
+    for _ in 0..row_count {
+        let mut values = Vec::with_capacity(num_kept);
+        let mut row_matches_runtime = true;
+
+        for (col_idx, col) in table_spec.column_specs.iter().enumerate() {
+            let needed = keep.map(|k| k[col_idx]).unwrap_or(true);
+            let is_runtime_col = col_idx == runtime_filter.full_col_idx;
+
+            if is_runtime_col {
+                if needed {
+                    let val = read_data_value(&buf, &mut offset, &col.data_type)?;
+                    row_matches_runtime = runtime_filter.matches_data(&val);
+                    if row_matches_runtime {
+                        values.push(val);
+                    }
+                } else {
+                    row_matches_runtime = matches_runtime_filter_encoded(
+                        runtime_filter,
+                        &buf,
+                        &mut offset,
+                        &col.data_type,
+                    )?;
+                }
+
+                if !row_matches_runtime {
+                    skip_remaining_columns(table_spec, &buf, &mut offset, col_idx + 1)?;
+                    break;
+                }
+                continue;
+            }
+
+            if needed {
+                values.push(read_data_value(&buf, &mut offset, &col.data_type)?);
+            } else {
+                skip_data_value(&buf, &mut offset, &col.data_type)?;
+            }
+        }
+
+        if !row_matches_runtime {
+            continue;
+        }
+
+        let row = Row::new(values);
+        if let Some(preds) = scan_filter {
+            if !eval_resolved(&row, preds)? {
+                continue;
+            }
+        }
+        rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+fn matches_runtime_filter_encoded(
+    runtime_filter: &RuntimeMembershipFilter,
+    buf: &BlockBuffer<'_>,
+    offset: &mut usize,
+    data_type: &DataType,
+) -> Result<bool> {
+    Ok(match (&runtime_filter.kind, data_type) {
+        (RuntimeMembershipFilterKind::ExactIntBitmap { base, bits }, DataType::Int32) => {
+            bitmap_contains(*base, bits, buf.read_i32(offset)? as i64)
+        }
+        (RuntimeMembershipFilterKind::ExactIntBitmap { base, bits }, DataType::Int64) => {
+            bitmap_contains(*base, bits, buf.read_i64(offset)?)
+        }
+        (RuntimeMembershipFilterKind::ExactIntBitmap { .. }, DataType::Float32) => {
+            let _ = buf.read_f32(offset)?;
+            false
+        }
+        (RuntimeMembershipFilterKind::ExactIntBitmap { .. }, DataType::Float64) => {
+            let _ = buf.read_f64(offset)?;
+            false
+        }
+        (RuntimeMembershipFilterKind::ExactIntBitmap { .. }, DataType::String) => {
+            buf.skip_cstring(offset)?;
+            false
+        }
+        (RuntimeMembershipFilterKind::Bloom { words, num_hashes }, DataType::Int32) => {
+            let mut h = FastHasher::default();
+            h.write_i32(buf.read_i32(offset)?);
+            bloom_might_contain(words, *num_hashes, h.finish())
+        }
+        (RuntimeMembershipFilterKind::Bloom { words, num_hashes }, DataType::Int64) => {
+            let mut h = FastHasher::default();
+            h.write_i64(buf.read_i64(offset)?);
+            bloom_might_contain(words, *num_hashes, h.finish())
+        }
+        (RuntimeMembershipFilterKind::Bloom { words, num_hashes }, DataType::Float32) => {
+            let mut h = FastHasher::default();
+            h.write_u32(buf.read_f32(offset)?.to_bits());
+            bloom_might_contain(words, *num_hashes, h.finish())
+        }
+        (RuntimeMembershipFilterKind::Bloom { words, num_hashes }, DataType::Float64) => {
+            let mut h = FastHasher::default();
+            h.write_u64(buf.read_f64(offset)?.to_bits());
+            bloom_might_contain(words, *num_hashes, h.finish())
+        }
+        (RuntimeMembershipFilterKind::Bloom { words, num_hashes }, DataType::String) => {
+            let hash = hash_cstring_in_block(buf, offset)?;
+            bloom_might_contain(words, *num_hashes, hash)
+        }
+    })
+}
+
+fn hash_cstring_in_block(buf: &BlockBuffer<'_>, offset: &mut usize) -> Result<u64> {
+    let usable_end = buf.usable_end()?;
+    let bytes = buf.as_slice();
+    let start = *offset;
+    while *offset < usable_end && bytes[*offset] != 0 {
+        *offset += 1;
+    }
+    if *offset >= usable_end {
+        return Err(anyhow!("unterminated string while hashing runtime membership key"));
+    }
+    let mut h = FastHasher::default();
+    h.write(&bytes[start..*offset]);
+    *offset += 1;
+    Ok(h.finish())
+}
+
+fn skip_remaining_columns(
+    table_spec: &TableSpec,
+    buf: &BlockBuffer<'_>,
+    offset: &mut usize,
+    start_col_idx: usize,
+) -> Result<()> {
+    for col in table_spec.column_specs.iter().skip(start_col_idx) {
+        skip_data_value(buf, offset, &col.data_type)?;
+    }
+    Ok(())
 }
 
 

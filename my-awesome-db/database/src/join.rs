@@ -9,19 +9,109 @@ use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter};
 
+type FastHashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+
+#[derive(Default)]
+pub struct FastHasher {
+    state: u64,
+}
+
+impl std::hash::Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = if self.state == 0 { FNV_OFFSET } else { self.state };
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        self.state = hash;
+    }
+
+    fn write_u8(&mut self, i: u8) { self.write(&[i]); }
+    fn write_u16(&mut self, i: u16) { self.write(&i.to_le_bytes()); }
+
+    /// Unrolled 4-byte FNV — eliminates loop overhead and the `to_le_bytes()`
+    /// stack allocation.  Called on every integer join-key hash during probing.
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        const P: u64 = 0x100000001b3;
+        let mut h = if self.state == 0 { 0xcbf29ce484222325u64 } else { self.state };
+        h ^= (i & 0xff) as u64;          h = h.wrapping_mul(P);
+        h ^= ((i >> 8) & 0xff) as u64;   h = h.wrapping_mul(P);
+        h ^= ((i >> 16) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 24) & 0xff) as u64;  h = h.wrapping_mul(P);
+        self.state = h;
+    }
+
+    /// Unrolled 8-byte FNV.
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        const P: u64 = 0x100000001b3;
+        let mut h = if self.state == 0 { 0xcbf29ce484222325u64 } else { self.state };
+        h ^= (i & 0xff) as u64;          h = h.wrapping_mul(P);
+        h ^= ((i >> 8) & 0xff) as u64;   h = h.wrapping_mul(P);
+        h ^= ((i >> 16) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 24) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 32) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 40) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 48) & 0xff) as u64;  h = h.wrapping_mul(P);
+        h ^= ((i >> 56) & 0xff) as u64;  h = h.wrapping_mul(P);
+        self.state = h;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) { self.write_u64(i as u64); }
+    #[inline]
+    fn write_i32(&mut self, i: i32) { self.write_u32(i as u32); }
+    #[inline]
+    fn write_i64(&mut self, i: i64) { self.write_u64(i as u64); }
+    fn finish(&self) -> u64 { self.state }
+}
+
 // ── join key ─────────────────────────────────────────────────────────────────
 
 /// A row's join-key values, comparable and hashable.
-#[derive(Hash, Eq, PartialEq)]
-struct JoinKey(Vec<KeyField>);
+#[derive(Eq, PartialEq, Clone)]
+enum JoinKey {
+    One(KeyField),
+    Many(Vec<KeyField>),
+}
 
-#[derive(Hash, Eq, PartialEq)]
+impl std::hash::Hash for JoinKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            JoinKey::One(kf) => kf.hash(h),
+            JoinKey::Many(kfs) => {
+                for kf in kfs {
+                    kf.hash(h);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Eq, PartialEq, Clone)]
 enum KeyField {
     I32(i32),
     I64(i64),
     F32(u32), // stored as bits so that bit-equal floats hash equally
     F64(u64),
     Str(String),
+}
+
+impl std::hash::Hash for KeyField {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            KeyField::I32(v) => h.write_i32(*v),
+            KeyField::I64(v) => h.write_i64(*v),
+            KeyField::F32(v) => h.write_u32(*v),
+            KeyField::F64(v) => h.write_u64(*v),
+            KeyField::Str(s) => s.hash(h),
+        }
+    }
 }
 
 fn to_key_field(d: &Data) -> KeyField {
@@ -35,19 +125,33 @@ fn to_key_field(d: &Data) -> KeyField {
 }
 
 fn make_key(row: &Row, indices: &[usize]) -> JoinKey {
-    JoinKey(indices.iter().map(|&i| to_key_field(&row.values()[i])).collect())
+    match indices {
+        [idx] => JoinKey::One(to_key_field(&row.values()[*idx])),
+        _ => JoinKey::Many(indices.iter().map(|&i| to_key_field(&row.values()[i])).collect()),
+    }
 }
 
 fn estimate_join_key_heap_size(key: &JoinKey) -> usize {
     use std::mem::size_of;
 
-    let mut total = size_of::<JoinKey>() + key.0.len() * size_of::<KeyField>() + 16;
-    for field in &key.0 {
-        if let KeyField::Str(s) = field {
-            total += s.capacity() + 16;
+    match key {
+        JoinKey::One(field) => {
+            let mut total = size_of::<JoinKey>();
+            if let KeyField::Str(s) = field {
+                total += s.capacity() + 16;
+            }
+            total
+        }
+        JoinKey::Many(fields) => {
+            let mut total = size_of::<JoinKey>() + fields.len() * size_of::<KeyField>() + 16;
+            for field in fields {
+                if let KeyField::Str(s) = field {
+                    total += s.capacity() + 16;
+                }
+            }
+            total
         }
     }
-    total
 }
 
 /// Compute partition number directly from row values.

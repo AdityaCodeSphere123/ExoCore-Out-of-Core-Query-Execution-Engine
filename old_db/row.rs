@@ -151,7 +151,7 @@ impl Row {
                 values
                     .get(idx)
                     .cloned()
-                    .ok_or_else(|| anyhow!("row index out of bounds: {}", idx))?,
+                    .ok_or_else(|| anyhow!("row index out of bounds: {}", idx))?
             );
         }
         Ok(Row::new(out))
@@ -195,12 +195,8 @@ impl Row {
         use std::fmt::Write as FmtWrite;
         for val in &self.values {
             match val {
-                Data::Int32(v) => {
-                    let _ = write!(out, "{}", v);
-                }
-                Data::Int64(v) => {
-                    let _ = write!(out, "{}", v);
-                }
+                Data::Int32(v) => { let _ = write!(out, "{}", v); }
+                Data::Int64(v) => { let _ = write!(out, "{}", v); }
                 Data::Float32(v) => {
                     let s = v.to_string();
                     out.push_str(&s);

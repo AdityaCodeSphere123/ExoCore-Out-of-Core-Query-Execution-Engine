@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use common::query::SortSpec;
 use common::Data;
 use std::cmp::Ordering;
@@ -9,11 +9,6 @@ use std::sync::Arc;
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter, TempStorageManager};
-
-const MAX_SORT_SPILL_BATCH_PAGES: usize = 512;
-const MAX_SORT_MERGE_READER_PAGES: usize = 128;
-const MAX_SORT_MERGE_TOTAL_READER_PAGES: usize = 128;
-const SORT_MISC_RESERVE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SortKey {
@@ -31,12 +26,18 @@ pub struct SortOperator<'a> {
 
 enum SortOutput {
     Pending,
-    InMemory(std::vec::IntoIter<Row>),
+    InMemory {
+        iter: std::vec::IntoIter<Row>,
+        reserved_bytes: usize,
+    },
     External(RunMerger),
 }
 
 impl<'a> SortOperator<'a> {
-    pub fn new(underlying: Box<dyn Operator + 'a>, sort_specs: &[SortSpec]) -> Result<Self> {
+    pub fn new(
+        underlying: Box<dyn Operator + 'a>,
+        sort_specs: &[SortSpec],
+    ) -> Result<Self> {
         let schema = underlying.schema().clone();
         let mut sort_keys = Vec::with_capacity(sort_specs.len());
 
@@ -57,45 +58,85 @@ impl<'a> SortOperator<'a> {
         })
     }
 
+    fn predicted_vec_capacity_after_push(current_capacity: usize) -> usize {
+        if current_capacity == 0 {
+            4
+        } else {
+            current_capacity.saturating_mul(2)
+        }
+    }
+
     fn prepare(&mut self, ctx: &mut ExecContext) -> Result<()> {
-        let row_budget = sort_row_budget_bytes(ctx);
         let mut rows: Vec<Row> = Vec::new();
         let mut bytes_used = 0usize;
+        let mut reserved_bytes = 0usize;
         let mut run_ids: Vec<TempFileId> = Vec::new();
 
         while let Some(row) = self.underlying.next(ctx)? {
-            let next_row_bytes = row.estimate_heap_size();
-            let next_capacity = projected_vec_capacity_after_push(rows.len(), rows.capacity());
-            let projected_mem = bytes_used
-                .saturating_add(next_row_bytes)
-                .saturating_add(next_capacity.saturating_mul(std::mem::size_of::<Row>()));
+            let row_bytes = row.estimate_heap_size();
+            let capacity_growth_bytes = if rows.len() < rows.capacity() {
+                0
+            } else {
+                let next_capacity = Self::predicted_vec_capacity_after_push(rows.capacity());
+                next_capacity
+                    .saturating_sub(rows.capacity())
+                    .saturating_mul(std::mem::size_of::<Row>())
+            };
+            let additional_bytes = row_bytes + capacity_growth_bytes;
+            let projected_reserved = reserved_bytes + additional_bytes;
 
-            if !rows.is_empty() && projected_mem >= row_budget {
+            let local_soft_limit = ctx.sort_run_bytes * 4/5;
+            let should_spill = (!rows.is_empty() && projected_reserved > local_soft_limit)
+                || (!rows.is_empty() && ctx.available_memory() < additional_bytes);
+
+            if should_spill {
                 sort_rows(&mut rows, &self.sort_keys);
                 let run_id = spill_run(ctx, &rows)?;
                 run_ids.push(run_id);
-
+                ctx.release_memory(reserved_bytes);
                 rows = Vec::new();
                 bytes_used = 0;
+                reserved_bytes = 0;
             }
 
-            bytes_used = bytes_used.saturating_add(next_row_bytes);
+            let capacity_growth_bytes = if rows.len() < rows.capacity() {
+                0
+            } else {
+                let next_capacity = Self::predicted_vec_capacity_after_push(rows.capacity());
+                next_capacity
+                    .saturating_sub(rows.capacity())
+                    .saturating_mul(std::mem::size_of::<Row>())
+            };
+            let additional_bytes = row_bytes + capacity_growth_bytes;
+            ctx.try_reserve_memory(additional_bytes)?;
+            reserved_bytes += additional_bytes;
+
             rows.push(row);
+            bytes_used += row_bytes;
         }
 
         if run_ids.is_empty() {
             sort_rows(&mut rows, &self.sort_keys);
-            self.output = SortOutput::InMemory(rows.into_iter());
+            self.output = SortOutput::InMemory {
+                iter: rows.into_iter(),
+                reserved_bytes,
+            };
         } else {
             if !rows.is_empty() {
                 sort_rows(&mut rows, &self.sort_keys);
                 let run_id = spill_run(ctx, &rows)?;
                 run_ids.push(run_id);
+                ctx.release_memory(reserved_bytes);
+                reserved_bytes = 0;
             }
 
             drop(rows);
 
-            self.output = SortOutput::External(RunMerger::new(ctx, run_ids, self.sort_keys.clone())?);
+            self.output = SortOutput::External(RunMerger::new(
+                ctx,
+                run_ids,
+                self.sort_keys.clone(),
+            )?);
         }
 
         self.prepared = true;
@@ -113,61 +154,34 @@ impl<'a> Operator for SortOperator<'a> {
             self.prepare(ctx)?;
         }
 
-        match &mut self.output {
+        match std::mem::replace(&mut self.output, SortOutput::Pending) {
             SortOutput::Pending => Ok(None),
-            SortOutput::InMemory(iter) => Ok(iter.next()),
-            SortOutput::External(merger) => {
+            SortOutput::InMemory { mut iter, reserved_bytes } => {
+                if let Some(row) = iter.next() {
+                    self.output = SortOutput::InMemory { iter, reserved_bytes };
+                    Ok(Some(row))
+                } else {
+                    ctx.release_memory(reserved_bytes);
+                    Ok(None)
+                }
+            }
+            SortOutput::External(mut merger) => {
                 let disk_reader = &mut *ctx.disk_reader;
                 let disk_writer = &mut *ctx.disk_writer;
                 let temp_storage = &*ctx.temp_storage;
-                merger.next_row(temp_storage, disk_reader, disk_writer)
+                let row = merger.next_row(temp_storage, disk_reader, disk_writer)?;
+                self.output = SortOutput::External(merger);
+                Ok(row)
             }
         }
     }
 }
 
-fn projected_vec_capacity_after_push(len: usize, cap: usize) -> usize {
-    if len < cap {
-        cap
-    } else if cap == 0 {
-        4
-    } else {
-        cap.saturating_mul(2)
-    }
-}
-
-fn choose_sort_spill_batch_pages(total_budget_bytes: usize, block_size: usize) -> usize {
-    let block_size = block_size.max(1);
-    let pages = total_budget_bytes / (8 * block_size);
-    pages.clamp(4, MAX_SORT_SPILL_BATCH_PAGES)
-}
-
-fn sort_writer_reserve_bytes(total_budget_bytes: usize, block_size: usize) -> usize {
-    let spill_pages = choose_sort_spill_batch_pages(total_budget_bytes, block_size);
-    spill_pages
-        .saturating_add(1)
-        .saturating_mul(block_size)
-        .saturating_add(SORT_MISC_RESERVE_BYTES)
-}
-
-fn sort_row_budget_bytes(ctx: &ExecContext) -> usize {
-    let block_size = ctx.temp_storage.block_size().max(1);
-    let reserve = sort_writer_reserve_bytes(ctx.sort_run_bytes, block_size);
-    ctx.sort_run_bytes.saturating_sub(reserve).max(block_size)
-}
-
-fn sort_merge_reader_budget_bytes(total_budget_bytes: usize, block_size: usize) -> usize {
-    let max_reader_budget = MAX_SORT_MERGE_TOTAL_READER_PAGES
-        .saturating_mul(block_size)
-        .max(block_size);
-    total_budget_bytes
-        .saturating_div(4)
-        .clamp(block_size, max_reader_budget)
-}
-
 fn spill_run(ctx: &mut ExecContext, rows: &[Row]) -> Result<TempFileId> {
+    // Large write batches → fewer extents per run → fewer non-sequential I/Os
+    // during the merge phase, directly reducing rotational latency.
     let block_size = ctx.temp_storage.block_size().max(1);
-    let batch_pages = choose_sort_spill_batch_pages(ctx.sort_run_bytes, block_size);
+    let batch_pages = (ctx.sort_run_bytes / block_size).max(1).min(300);
     let mut writer = TempRunWriter::with_batch_pages(ctx.temp_storage, batch_pages)?;
     for row in rows {
         writer.append_row(row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
@@ -211,8 +225,8 @@ fn compare_data_ord(left: &Data, right: &Data) -> Ordering {
         (Data::Float64(a), Data::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Data::String(a), Data::String(b)) => a.cmp(b),
         _ => Ordering::Equal,
-    }
-}
+    }}
+
 
 struct RunMerger {
     readers: Vec<TempRunReader>,
@@ -220,18 +234,21 @@ struct RunMerger {
 }
 
 impl RunMerger {
-    fn new(ctx: &mut ExecContext, run_ids: Vec<TempFileId>, sort_keys: Vec<SortKey>) -> Result<Self> {
+    fn new(
+        ctx: &mut ExecContext,
+        run_ids: Vec<TempFileId>,
+        sort_keys: Vec<SortKey>,
+    ) -> Result<Self> {
         let shared_keys = Arc::new(sort_keys);
         let mut readers = Vec::with_capacity(run_ids.len());
         let mut heap = BinaryHeap::new();
 
-        let block_size = ctx.temp_storage.block_size().max(1);
+        // Spread available memory across all run readers so each gets a
+        // larger batch buffer, drastically reducing seek count during merge.
+        let block_size = ctx.temp_storage.block_size();
         let num_runs = run_ids.len();
-        let total_reader_budget = sort_merge_reader_budget_bytes(ctx.sort_run_bytes, block_size);
-        let reader_batch_pages = if num_runs > 0 {
-            (total_reader_budget / (num_runs * block_size))
-                .max(1)
-                .min(MAX_SORT_MERGE_READER_PAGES)
+        let reader_batch_pages = if num_runs > 0 && block_size > 0 {
+            (ctx.sort_run_bytes / (num_runs * block_size)).max(1).min(300)
         } else {
             16
         };
@@ -241,7 +258,8 @@ impl RunMerger {
         let temp_storage = &*ctx.temp_storage;
 
         for (run_idx, run_id) in run_ids.into_iter().enumerate() {
-            let mut reader = TempRunReader::with_batch_pages(temp_storage, run_id, reader_batch_pages)?;
+            let mut reader =
+                TempRunReader::with_batch_pages(temp_storage, run_id, reader_batch_pages)?;
             if let Some(row) = reader.next_row(temp_storage, disk_reader, disk_writer)? {
                 heap.push(HeapItem {
                     row,
@@ -309,7 +327,11 @@ impl PartialOrd for HeapItem {
 
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        compare_rows(&self.sort_keys, &other.row, &self.row)
-            .then_with(|| other.run_idx.cmp(&self.run_idx))
+        let ord = compare_rows(&self.sort_keys, &self.row, &other.row);
+        if ord == Ordering::Equal {
+            other.run_idx.cmp(&self.run_idx)
+        } else {
+            ord.reverse()
+        }
     }
 }
