@@ -46,9 +46,9 @@ pub struct OrderedScanBounds {
 pub struct ScanOperator {
     table_id: String,
     schema: RowSchema,
-    /// Per-column keep flag for late materialization.  Empty = keep all columns.
+    /// Per-column keep flag for late materialization. Empty = keep all columns.
     keep_columns: Vec<bool>,
-    /// Local single-relation predicates fused into the scan itself.  These are
+    /// Local single-relation predicates fused into the scan itself. These are
     /// resolved against the scan's output schema after column pruning, so rows
     /// that fail never enter the higher operator pipeline.
     scan_filter: Vec<ResolvedPredicate>,
@@ -58,10 +58,23 @@ pub struct ScanOperator {
     current_block_offset: u64,
     current_rows: Option<std::vec::IntoIter<Row>>,
     prefetched_rows: VecDeque<std::vec::IntoIter<Row>>,
+
+    /// Reused read buffer for scan prefetch batches.
+    /// Avoids allocating a fresh Vec<u8> on every refill.
+    batch_buf: Vec<u8>,
+
+    /// Cached decode plan for this scan's projected columns.
+    /// Built once after we know the table spec and keep_columns.
+    decode_plan: Option<Vec<ColDecodeOp>>,
+
+    /// Number of output columns produced by decode_plan.
+    num_kept: usize,
 }
 
 impl ScanOperator {
     pub fn new(table_id: String, schema: RowSchema) -> Self {
+        let num_kept = schema.len();
+
         Self {
             table_id,
             schema,
@@ -73,6 +86,9 @@ impl ScanOperator {
             current_block_offset: 0,
             current_rows: None,
             prefetched_rows: VecDeque::new(),
+            batch_buf: Vec::new(),
+            decode_plan: None,
+            num_kept,
         }
     }
 
@@ -81,7 +97,10 @@ impl ScanOperator {
         for i in needed {
             keep[i] = true;
         }
+
+        self.num_kept = keep.iter().filter(|&&v| v).count();
         self.keep_columns = keep;
+        self.decode_plan = None;
         self
     }
 
@@ -95,8 +114,29 @@ impl ScanOperator {
         self
     }
 
+    fn ensure_decode_plan(&mut self, table_spec: &TableSpec) {
+        if self.decode_plan.is_some() {
+            return;
+        }
+
+        let keep = if self.keep_columns.is_empty() {
+            None
+        } else {
+            Some(self.keep_columns.as_slice())
+        };
+
+        self.num_kept = keep
+            .map(|k| k.iter().filter(|&&v| v).count())
+            .unwrap_or(table_spec.column_specs.len());
+
+        self.decode_plan = Some(build_col_decode_plan(table_spec, keep));
+    }
+
     fn refill_prefetch_buffer(&mut self, ctx: &mut crate::operator::ExecContext) -> Result<bool> {
         let table_spec = get_table_spec(ctx.db_ctx, &self.table_id)?;
+
+        self.ensure_decode_plan(table_spec);
+
         if self.start_block.is_none() {
             let file_start = get_file_start_block(
                 ctx.disk_reader,
@@ -138,33 +178,35 @@ impl ScanOperator {
         let block_size = ctx.buffer_manager.block_size();
         let batch_start_block = start_block + self.current_block_offset;
 
-        let batch_buf = get_blocks(
+        get_blocks_into(
             ctx.disk_reader,
             ctx.disk_writer,
             batch_start_block,
             batch_blocks as u64,
             block_size,
+            &mut self.batch_buf,
         )?;
 
-        let keep = if self.keep_columns.is_empty() {
-            None
-        } else {
-            Some(self.keep_columns.as_slice())
-        };
+        let decode_plan = self
+            .decode_plan
+            .as_ref()
+            .expect("decode plan must be initialized before scan refill");
 
         for block_idx in 0..batch_blocks {
             let start = block_idx * block_size;
             let end = start + block_size;
-            let block_rows = if self.scan_filter.is_empty() {
-                decode_block_into_rows(table_spec, &batch_buf[start..end], keep)?
-            } else {
-                decode_block_into_rows_filtered(
-                    table_spec,
-                    &batch_buf[start..end],
-                    keep,
-                    &self.scan_filter,
-                )?
-            };
+
+            let block_rows = decode_block_into_rows_with_plan(
+                &self.batch_buf[start..end],
+                decode_plan,
+                self.num_kept,
+                if self.scan_filter.is_empty() {
+                    None
+                } else {
+                    Some(self.scan_filter.as_slice())
+                },
+            )?;
+
             self.prefetched_rows.push_back(block_rows.into_iter());
         }
 
@@ -262,13 +304,41 @@ where
     RDisk: BufRead + ?Sized,
     WDisk: Write + ?Sized,
 {
+    let mut buf = Vec::new();
+    get_blocks_into(
+        disk_reader,
+        disk_writer,
+        start_block_id,
+        num_blocks,
+        block_size,
+        &mut buf,
+    )?;
+    Ok(buf)
+}
+
+pub fn get_blocks_into<RDisk, WDisk>(
+    disk_reader: &mut RDisk,
+    disk_writer: &mut WDisk,
+    start_block_id: u64,
+    num_blocks: u64,
+    block_size: usize,
+    out: &mut Vec<u8>,
+) -> Result<()>
+where
+    RDisk: BufRead + ?Sized,
+    WDisk: Write + ?Sized,
+{
     let cmd = format!("get block {} {}\n", start_block_id, num_blocks);
     disk_writer.write_all(cmd.as_bytes())?;
     disk_writer.flush()?;
 
-    let mut buf = vec![0u8; block_size * (num_blocks as usize)];
-    std::io::Read::read_exact(disk_reader, &mut buf)?;
-    Ok(buf)
+    let needed_len = block_size
+        .checked_mul(num_blocks as usize)
+        .ok_or_else(|| anyhow!("get_blocks buffer size overflow"))?;
+
+    out.resize(needed_len, 0);
+    std::io::Read::read_exact(disk_reader, out)?;
+    Ok(())
 }
 
 pub fn decode_block_into_rows(
@@ -276,7 +346,12 @@ pub fn decode_block_into_rows(
     block: &[u8],
     keep: Option<&[bool]>,
 ) -> Result<Vec<Row>> {
-    decode_block_into_rows_maybe_filtered(table_spec, block, keep, None)
+    let num_kept = keep
+        .map(|k| k.iter().filter(|&&v| v).count())
+        .unwrap_or(table_spec.column_specs.len());
+
+    let plan = build_col_decode_plan(table_spec, keep);
+    decode_block_into_rows_with_plan(block, &plan, num_kept, None)
 }
 
 pub fn decode_block_into_rows_filtered(
@@ -285,31 +360,29 @@ pub fn decode_block_into_rows_filtered(
     keep: Option<&[bool]>,
     scan_filter: &[ResolvedPredicate],
 ) -> Result<Vec<Row>> {
-    decode_block_into_rows_maybe_filtered(table_spec, block, keep, Some(scan_filter))
+    let num_kept = keep
+        .map(|k| k.iter().filter(|&&v| v).count())
+        .unwrap_or(table_spec.column_specs.len());
+
+    let plan = build_col_decode_plan(table_spec, keep);
+    decode_block_into_rows_with_plan(block, &plan, num_kept, Some(scan_filter))
 }
 
-fn decode_block_into_rows_maybe_filtered(
-    table_spec: &TableSpec,
+fn decode_block_into_rows_with_plan(
     block: &[u8],
-    keep: Option<&[bool]>,
+    plan: &[ColDecodeOp],
+    num_kept: usize,
     scan_filter: Option<&[ResolvedPredicate]>,
 ) -> Result<Vec<Row>> {
     let buf = BlockBuffer::new(block);
     let row_count = buf.row_count()?;
     let mut offset = 0usize;
-
-    let num_kept = keep
-        .map(|k| k.iter().filter(|&&v| v).count())
-        .unwrap_or(table_spec.column_specs.len());
     let mut rows = Vec::with_capacity(row_count);
-
-    // Build the decode plan once outside the row loop.
-    let plan = build_col_decode_plan(table_spec, keep);
 
     for _ in 0..row_count {
         let mut values = Vec::with_capacity(num_kept);
 
-        for &op in &plan {
+        for &op in plan {
             match op {
                 ColDecodeOp::KeepI32 => values.push(Data::Int32(buf.read_i32(&mut offset)?)),
                 ColDecodeOp::KeepI64 => values.push(Data::Int64(buf.read_i64(&mut offset)?)),

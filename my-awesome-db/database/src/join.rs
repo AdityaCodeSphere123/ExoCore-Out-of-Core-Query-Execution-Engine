@@ -3,8 +3,7 @@ use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
-
-use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
+use crate::filter::{eval_resolved_two_parts, resolve_predicates, ResolvedPredicate};
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter};
@@ -178,8 +177,8 @@ fn partition_hash_with_salt(
 }
 
 const MIN_HASH_JOIN_PARTITIONS: usize = 8;
-const MAX_HASH_JOIN_PARTITIONS: usize = 32;
-const TARGET_PARTITION_PAGES: usize = 256;
+const MAX_HASH_JOIN_PARTITIONS: usize = 28;
+const TARGET_PARTITION_PAGES: usize = 300;
 const HASH_JOIN_MAX_REPARTITION_DEPTH: usize = 3;
 const HASH_JOIN_BUILD_READER_PAGES: usize = 128;
 const HASH_JOIN_PROBE_READER_PAGES: usize = 128;
@@ -485,69 +484,288 @@ impl<'a> HashJoinOperator<'a> {
         let mut right_writers: Vec<Option<TempRunWriter>> =
             (0..num_partitions).map(|_| None).collect();
 
-        // Build a Bloom filter from all left-side join keys.  When we stream
-        // the right (probe) side, any row whose key hash is absent in the
-        // filter is guaranteed to have no matching left row — skip it
-        // entirely and avoid writing it to a partition file at all.
-        // This is the single biggest I/O win for queries like Q3/Q5/Q20/Q21
-        // where the probe side is lineitem (1333 pages) but only a small
-        // fraction of its rows can ever join with the filtered build side.
+        // Build Bloom from the estimated smaller side.
+        //
+        // Old behavior:
+        //   always build Bloom from left, filter right.
+        //
+        // New behavior:
+        //   if left is estimated smaller/equal: build Bloom from left, filter right.
+        //   if right is estimated smaller:      build Bloom from right, filter left.
+        //
+        // If hints are missing, preserve the old left-Bloom behavior unless only
+        // the right side has a hint.
+        let bloom_from_left = match (self.left_rows_hint, self.right_rows_hint) {
+            (Some(l), Some(r)) => l <= r,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        };
+
         let mut bloom = BloomFilter::new();
 
-        // Drain any rows prefetched during a failed in-memory attempt, then read from operator.
-        for row in std::mem::take(&mut self.left_prefetched) {
-            bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
-            let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
-            if left_writers[part].is_none() {
-                left_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
-            }
-            left_writers[part].as_mut().unwrap().append_row(
-                &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
-            )?;
-        }
-        if let Some(mut left) = self.left.take() {
-            loop {
-                let maybe = left.next(ctx)?;
-                let row = match maybe { Some(r) => r, None => break };
+        if bloom_from_left {
+            // ------------------------------------------------------------
+            // Case 1: Build Bloom from LEFT, filter RIGHT.
+            // ------------------------------------------------------------
+
+            // Drain any left rows prefetched during a failed in-memory attempt.
+            for row in std::mem::take(&mut self.left_prefetched) {
                 bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
-                let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
+
+                let part = partition_hash_with_salt(
+                    &row,
+                    &self.left_key_indices,
+                    num_partitions,
+                    0,
+                );
+
                 if left_writers[part].is_none() {
-                    left_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
+                    left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                        ctx.temp_storage,
+                        writer_batch,
+                    )?);
                 }
+
                 left_writers[part].as_mut().unwrap().append_row(
-                    &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
                 )?;
+            }
+
+            // Stream remaining left input.
+            if let Some(mut left) = self.left.take() {
+                loop {
+                    let maybe = left.next(ctx)?;
+                    let row = match maybe {
+                        Some(r) => r,
+                        None => break,
+                    };
+
+                    bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
+
+                    let part = partition_hash_with_salt(
+                        &row,
+                        &self.left_key_indices,
+                        num_partitions,
+                        0,
+                    );
+
+                    if left_writers[part].is_none() {
+                        left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                            ctx.temp_storage,
+                            writer_batch,
+                        )?);
+                    }
+
+                    left_writers[part].as_mut().unwrap().append_row(
+                        &row,
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                }
+            }
+
+            // Drain prefetched right rows, filtering with Bloom.
+            for row in std::mem::take(&mut self.right_prefetched) {
+                let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
+                if !bloom.may_contain(key_hash) {
+                    continue;
+                }
+
+                let part = partition_hash_with_salt(
+                    &row,
+                    &self.right_key_indices,
+                    num_partitions,
+                    0,
+                );
+
+                if right_writers[part].is_none() {
+                    right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                        ctx.temp_storage,
+                        writer_batch,
+                    )?);
+                }
+
+                right_writers[part].as_mut().unwrap().append_row(
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
+                )?;
+            }
+
+            // Stream remaining right input, filtering with Bloom.
+            if let Some(mut right) = self.right.take() {
+                loop {
+                    let maybe = right.next(ctx)?;
+                    let row = match maybe {
+                        Some(r) => r,
+                        None => break,
+                    };
+
+                    let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
+                    if !bloom.may_contain(key_hash) {
+                        continue;
+                    }
+
+                    let part = partition_hash_with_salt(
+                        &row,
+                        &self.right_key_indices,
+                        num_partitions,
+                        0,
+                    );
+
+                    if right_writers[part].is_none() {
+                        right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                            ctx.temp_storage,
+                            writer_batch,
+                        )?);
+                    }
+
+                    right_writers[part].as_mut().unwrap().append_row(
+                        &row,
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                }
+            }
+        } else {
+            // ------------------------------------------------------------
+            // Case 2: Build Bloom from RIGHT, filter LEFT.
+            // ------------------------------------------------------------
+
+            // Drain any right rows prefetched during a failed in-memory attempt.
+            for row in std::mem::take(&mut self.right_prefetched) {
+                bloom.insert(compute_join_key_hash(&row, &self.right_key_indices));
+
+                let part = partition_hash_with_salt(
+                    &row,
+                    &self.right_key_indices,
+                    num_partitions,
+                    0,
+                );
+
+                if right_writers[part].is_none() {
+                    right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                        ctx.temp_storage,
+                        writer_batch,
+                    )?);
+                }
+
+                right_writers[part].as_mut().unwrap().append_row(
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
+                )?;
+            }
+
+            // Stream remaining right input.
+            if let Some(mut right) = self.right.take() {
+                loop {
+                    let maybe = right.next(ctx)?;
+                    let row = match maybe {
+                        Some(r) => r,
+                        None => break,
+                    };
+
+                    bloom.insert(compute_join_key_hash(&row, &self.right_key_indices));
+
+                    let part = partition_hash_with_salt(
+                        &row,
+                        &self.right_key_indices,
+                        num_partitions,
+                        0,
+                    );
+
+                    if right_writers[part].is_none() {
+                        right_writers[part] = Some(TempRunWriter::with_batch_pages(
+                            ctx.temp_storage,
+                            writer_batch,
+                        )?);
+                    }
+
+                    right_writers[part].as_mut().unwrap().append_row(
+                        &row,
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                }
+            }
+
+            // Drain prefetched left rows, filtering with Bloom.
+            for row in std::mem::take(&mut self.left_prefetched) {
+                let key_hash = compute_join_key_hash(&row, &self.left_key_indices);
+                if !bloom.may_contain(key_hash) {
+                    continue;
+                }
+
+                let part = partition_hash_with_salt(
+                    &row,
+                    &self.left_key_indices,
+                    num_partitions,
+                    0,
+                );
+
+                if left_writers[part].is_none() {
+                    left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                        ctx.temp_storage,
+                        writer_batch,
+                    )?);
+                }
+
+                left_writers[part].as_mut().unwrap().append_row(
+                    &row,
+                    ctx.temp_storage,
+                    &mut *ctx.disk_reader,
+                    &mut *ctx.disk_writer,
+                )?;
+            }
+
+            // Stream remaining left input, filtering with Bloom.
+            if let Some(mut left) = self.left.take() {
+                loop {
+                    let maybe = left.next(ctx)?;
+                    let row = match maybe {
+                        Some(r) => r,
+                        None => break,
+                    };
+
+                    let key_hash = compute_join_key_hash(&row, &self.left_key_indices);
+                    if !bloom.may_contain(key_hash) {
+                        continue;
+                    }
+
+                    let part = partition_hash_with_salt(
+                        &row,
+                        &self.left_key_indices,
+                        num_partitions,
+                        0,
+                    );
+
+                    if left_writers[part].is_none() {
+                        left_writers[part] = Some(TempRunWriter::with_batch_pages(
+                            ctx.temp_storage,
+                            writer_batch,
+                        )?);
+                    }
+
+                    left_writers[part].as_mut().unwrap().append_row(
+                        &row,
+                        ctx.temp_storage,
+                        &mut *ctx.disk_reader,
+                        &mut *ctx.disk_writer,
+                    )?;
+                }
             }
         }
 
-        // Drain prefetched right rows then read from operator, filtering with bloom.
-        for row in std::mem::take(&mut self.right_prefetched) {
-            let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
-            if !bloom.may_contain(key_hash) { continue; }
-            let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
-            if right_writers[part].is_none() {
-                right_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
-            }
-            right_writers[part].as_mut().unwrap().append_row(
-                &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
-            )?;
-        }
-        if let Some(mut right) = self.right.take() {
-            loop {
-                let maybe = right.next(ctx)?;
-                let row = match maybe { Some(r) => r, None => break };
-                // Bloom filter early-exit: skip rows that definitely have no match.
-                let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
-                if !bloom.may_contain(key_hash) { continue; }
-                let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
-                if right_writers[part].is_none() {
-                    right_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
-                }
-                right_writers[part].as_mut().unwrap().append_row(
-                    &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
-                )?;
-            }
-        }
         drop(bloom);
 
         let mut tasks = VecDeque::new();
@@ -560,11 +778,13 @@ impl<'a> HashJoinOperator<'a> {
                         &mut *ctx.disk_reader,
                         &mut *ctx.disk_writer,
                     )?;
+
                     let right_file = right_writer.finish(
                         ctx.temp_storage,
                         &mut *ctx.disk_reader,
                         &mut *ctx.disk_writer,
                     )?;
+
                     tasks.push_back(PartitionTask {
                         left_file,
                         right_file,
@@ -572,23 +792,25 @@ impl<'a> HashJoinOperator<'a> {
                         salt: 0,
                     });
                 }
+
                 (Some(left_writer), None) => {
                     let file_id = left_writer.file_id();
                     drop(left_writer);
                     ctx.temp_storage.delete_temp_file(file_id)?;
                 }
+
                 (None, Some(right_writer)) => {
                     let file_id = right_writer.file_id();
                     drop(right_writer);
                     ctx.temp_storage.delete_temp_file(file_id)?;
                 }
+
                 (None, None) => {}
             }
         }
 
         Ok(tasks)
     }
-
     fn repartition_task(
         &self,
         ctx: &mut ExecContext,
@@ -924,9 +1146,6 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                 .saturating_add(HASH_JOIN_ENTRY_OVERHEAD_BYTES);
 
                             if bytes_used.saturating_add(row_bytes) > inmem_budget {
-                                // Keep the row already consumed, but do NOT drain
-                                // the remaining build operator into memory. Put the
-                                // operator back below and let partition_inputs stream it.
                                 build_rows.push(row);
                                 overflowed = true;
                                 break;
@@ -948,8 +1167,6 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                 output_buf: Vec::new(),
                             };
                         } else {
-                            // Replay only the few rows consumed before overflow,
-                            // then continue streaming the rest through Grace Hash Join.
                             if build_is_left {
                                 self.left = Some(build_op);
                                 self.left_prefetched = build_rows;
@@ -974,13 +1191,20 @@ impl<'a> Operator for HashJoinOperator<'a> {
                     }
                 }
 
-                HashJoinState::InMemoryProbing { build_map, build_is_left, mut output_buf } => {
+                HashJoinState::InMemoryProbing {
+                    build_map,
+                    build_is_left,
+                    mut output_buf,
+                } => {
                     if let Some(row) = output_buf.pop() {
-                        self.state = HashJoinState::InMemoryProbing { build_map, build_is_left, output_buf };
+                        self.state = HashJoinState::InMemoryProbing {
+                            build_map,
+                            build_is_left,
+                            output_buf,
+                        };
                         return Ok(Some(row));
                     }
 
-                    // Pull next probe row directly from the live operator.
                     let probe_row = if build_is_left {
                         self.right.as_mut().unwrap().next(ctx)?
                     } else {
@@ -991,25 +1215,50 @@ impl<'a> Operator for HashJoinOperator<'a> {
                         None => {
                             self.state = HashJoinState::Done;
                         }
+
                         Some(probe_row) => {
                             let key = if build_is_left {
                                 make_key(&probe_row, &self.right_key_indices)
                             } else {
                                 make_key(&probe_row, &self.left_key_indices)
                             };
+
                             if let Some(build_rows_match) = build_map.get(&key) {
                                 for build_row in build_rows_match {
-                                    let merged = if build_is_left {
-                                        Row::merge(build_row, &probe_row)
+                                    if build_is_left {
+                                        // Original order: left = build_row, right = probe_row.
+                                        // Evaluate residual predicates before allocating merged row.
+                                        if self.resolved_extra.is_empty()
+                                            || eval_resolved_two_parts(
+                                                build_row,
+                                                &probe_row,
+                                                build_row.len(),
+                                                &self.resolved_extra,
+                                            )?
+                                        {
+                                            output_buf.push(Row::merge(build_row, &probe_row));
+                                        }
                                     } else {
-                                        Row::merge(&probe_row, build_row)
-                                    };
-                                    if eval_resolved(&merged, &self.resolved_extra)? {
-                                        output_buf.push(merged);
+                                        // Original order: left = probe_row, right = build_row.
+                                        if self.resolved_extra.is_empty()
+                                            || eval_resolved_two_parts(
+                                                &probe_row,
+                                                build_row,
+                                                probe_row.len(),
+                                                &self.resolved_extra,
+                                            )?
+                                        {
+                                            output_buf.push(Row::merge(&probe_row, build_row));
+                                        }
                                     }
                                 }
                             }
-                            self.state = HashJoinState::InMemoryProbing { build_map, build_is_left, output_buf };
+
+                            self.state = HashJoinState::InMemoryProbing {
+                                build_map,
+                                build_is_left,
+                                output_buf,
+                            };
                         }
                     }
                 }
@@ -1056,22 +1305,42 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                     self.cleanup_task(ctx, task)?;
                                     self.state = HashJoinState::Probing(ps);
                                 }
+
                                 Some(probe_row) => {
                                     let probe_keys: &[usize] = if build_is_left {
                                         &self.right_key_indices
                                     } else {
                                         &self.left_key_indices
                                     };
+
                                     let key = make_key(&probe_row, probe_keys);
+
                                     if let Some(build_rows) = build_map.get(&key) {
                                         for build_row in build_rows {
-                                            let merged = if build_is_left {
-                                                Row::merge(build_row, &probe_row)
+                                            if build_is_left {
+                                                // Original order: left = build_row, right = probe_row.
+                                                if self.resolved_extra.is_empty()
+                                                    || eval_resolved_two_parts(
+                                                        build_row,
+                                                        &probe_row,
+                                                        build_row.len(),
+                                                        &self.resolved_extra,
+                                                    )?
+                                                {
+                                                    ps.output_buf.push(Row::merge(build_row, &probe_row));
+                                                }
                                             } else {
-                                                Row::merge(&probe_row, build_row)
-                                            };
-                                            if eval_resolved(&merged, &self.resolved_extra)? {
-                                                ps.output_buf.push(merged);
+                                                // Original order: left = probe_row, right = build_row.
+                                                if self.resolved_extra.is_empty()
+                                                    || eval_resolved_two_parts(
+                                                        &probe_row,
+                                                        build_row,
+                                                        probe_row.len(),
+                                                        &self.resolved_extra,
+                                                    )?
+                                                {
+                                                    ps.output_buf.push(Row::merge(&probe_row, build_row));
+                                                }
                                             }
                                         }
                                     }
@@ -1082,6 +1351,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                         probe_reader,
                                         build_is_left,
                                     });
+
                                     self.state = HashJoinState::Probing(ps);
                                 }
                             }
@@ -1104,13 +1374,30 @@ impl<'a> Operator for HashJoinOperator<'a> {
                             match maybe_inner {
                                 Some(inner_row) => {
                                     for outer_row in outer_batch.iter().rev() {
-                                        let merged = if inner_is_left {
-                                            Row::merge(&inner_row, outer_row)
+                                        if inner_is_left {
+                                            // Original order: left = inner_row, right = outer_row.
+                                            if self.resolved_extra.is_empty()
+                                                || eval_resolved_two_parts(
+                                                    &inner_row,
+                                                    outer_row,
+                                                    inner_row.len(),
+                                                    &self.resolved_extra,
+                                                )?
+                                            {
+                                                ps.output_buf.push(Row::merge(&inner_row, outer_row));
+                                            }
                                         } else {
-                                            Row::merge(outer_row, &inner_row)
-                                        };
-                                        if eval_resolved(&merged, &self.resolved_extra)? {
-                                            ps.output_buf.push(merged);
+                                            // Original order: left = outer_row, right = inner_row.
+                                            if self.resolved_extra.is_empty()
+                                                || eval_resolved_two_parts(
+                                                    outer_row,
+                                                    &inner_row,
+                                                    outer_row.len(),
+                                                    &self.resolved_extra,
+                                                )?
+                                            {
+                                                ps.output_buf.push(Row::merge(outer_row, &inner_row));
+                                            }
                                         }
                                     }
 
@@ -1122,10 +1409,13 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                         outer_batch,
                                         inner_reader,
                                     });
+
                                     self.state = HashJoinState::Probing(ps);
                                 }
+
                                 None => {
                                     outer_batch = fill_temp_outer_batch(&mut outer_reader, ctx)?;
+
                                     if outer_batch.is_empty() {
                                         self.cleanup_task(ctx, task)?;
                                         self.state = HashJoinState::Probing(ps);
@@ -1135,6 +1425,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                             inner_file,
                                             HASH_JOIN_BUILD_READER_PAGES,
                                         )?;
+
                                         ps.active = Some(ActivePartition::NestedLoop {
                                             task,
                                             inner_is_left,
@@ -1143,6 +1434,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                             outer_batch,
                                             inner_reader,
                                         });
+
                                         self.state = HashJoinState::Probing(ps);
                                     }
                                 }
@@ -1154,7 +1446,6 @@ impl<'a> Operator for HashJoinOperator<'a> {
         }
     }
 }
-
 // ── Block Nested-Loop Join (fallback for non-equi conditions) ───────────────
 
 const MAX_BNLJ_OUTER_BATCH_PAGES: usize = 64;
@@ -1295,6 +1586,7 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
 
                 BlockNestedLoopState::NeedOuterBatch { inner_file } => {
                     let outer_batch = self.fill_outer_batch(ctx)?;
+
                     if outer_batch.is_empty() {
                         ctx.temp_storage.delete_temp_file(inner_file)?;
                         self.state = BlockNestedLoopState::Done;
@@ -1302,6 +1594,7 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
                     }
 
                     let inner_reader = TempRunReader::new(ctx.temp_storage, inner_file)?;
+
                     self.state = BlockNestedLoopState::ScanningInner {
                         inner_file,
                         outer_batch,
@@ -1336,17 +1629,37 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
                         None => {
                             self.state = BlockNestedLoopState::NeedOuterBatch { inner_file };
                         }
+
                         Some(inner_row) => {
                             for outer_row in outer_batch.iter().rev() {
-                                let merged = if self.inner_is_left {
-                                    Row::merge(&inner_row, outer_row)
+                                if self.inner_is_left {
+                                    // Original order: left = inner_row, right = outer_row.
+                                    // Evaluate predicates before allocating merged row.
+                                    if self.resolved.is_empty()
+                                        || eval_resolved_two_parts(
+                                            &inner_row,
+                                            outer_row,
+                                            inner_row.len(),
+                                            &self.resolved,
+                                        )?
+                                    {
+                                        output_buf.push(Row::merge(&inner_row, outer_row));
+                                    }
                                 } else {
-                                    Row::merge(outer_row, &inner_row)
-                                };
-                                if eval_resolved(&merged, &self.resolved)? {
-                                    output_buf.push(merged);
+                                    // Original order: left = outer_row, right = inner_row.
+                                    if self.resolved.is_empty()
+                                        || eval_resolved_two_parts(
+                                            outer_row,
+                                            &inner_row,
+                                            outer_row.len(),
+                                            &self.resolved,
+                                        )?
+                                    {
+                                        output_buf.push(Row::merge(outer_row, &inner_row));
+                                    }
                                 }
                             }
+
                             self.state = BlockNestedLoopState::ScanningInner {
                                 inner_file,
                                 outer_batch,

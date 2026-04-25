@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use common::query::SortSpec;
 use common::Data;
 use std::cmp::Ordering;
@@ -13,6 +13,7 @@ use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter, TempStorageM
 const MAX_SORT_SPILL_BATCH_PAGES: usize = 512;
 const MAX_SORT_MERGE_READER_PAGES: usize = 128;
 const MAX_SORT_MERGE_TOTAL_READER_PAGES: usize = 128;
+const MIN_SORT_MERGE_READER_PAGES: usize = 8;
 const SORT_MISC_RESERVE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
@@ -95,7 +96,17 @@ impl<'a> SortOperator<'a> {
 
             drop(rows);
 
-            self.output = SortOutput::External(RunMerger::new(ctx, run_ids, self.sort_keys.clone())?);
+            // If too many initial runs are handed directly to the final merger,
+            // each TempRunReader gets a tiny batch. That hurts the disk simulator
+            // because reads bounce across many temp files. Grouped merge collapses
+            // runs in passes until the final fan-in is small enough for each reader
+            // to receive a decent batch size.
+            let final_run_ids = collapse_runs_for_grouped_merge(ctx, run_ids, &self.sort_keys)?;
+            self.output = SortOutput::External(RunMerger::new(
+                ctx,
+                final_run_ids,
+                self.sort_keys.clone(),
+            )?);
         }
 
         self.prepared = true;
@@ -165,6 +176,20 @@ fn sort_merge_reader_budget_bytes(total_budget_bytes: usize, block_size: usize) 
         .clamp(block_size, max_reader_budget)
 }
 
+fn choose_sort_merge_fan_in(ctx: &ExecContext) -> usize {
+    let block_size = ctx.temp_storage.block_size().max(1);
+    let total_reader_pages = sort_merge_reader_budget_bytes(ctx.sort_run_bytes, block_size)
+        .saturating_div(block_size)
+        .max(1);
+
+    // Keep at least MIN_SORT_MERGE_READER_PAGES pages per active run whenever
+    // possible. With the default 128-page total reader budget and an 8-page
+    // minimum, this gives fan-in 16.
+    total_reader_pages
+        .saturating_div(MIN_SORT_MERGE_READER_PAGES)
+        .max(2)
+}
+
 fn spill_run(ctx: &mut ExecContext, rows: &[Row]) -> Result<TempFileId> {
     let block_size = ctx.temp_storage.block_size().max(1);
     let batch_pages = choose_sort_spill_batch_pages(ctx.sort_run_bytes, block_size);
@@ -173,6 +198,87 @@ fn spill_run(ctx: &mut ExecContext, rows: &[Row]) -> Result<TempFileId> {
         writer.append_row(row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)?;
     }
     writer.finish(ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer)
+}
+
+fn collapse_runs_for_grouped_merge(
+    ctx: &mut ExecContext,
+    run_ids: Vec<TempFileId>,
+    sort_keys: &[SortKey],
+) -> Result<Vec<TempFileId>> {
+    let fan_in = choose_sort_merge_fan_in(ctx);
+    if run_ids.len() <= fan_in {
+        return Ok(run_ids);
+    }
+
+    let mut current = run_ids;
+
+    while current.len() > fan_in {
+        let mut next = Vec::with_capacity((current.len() + fan_in - 1) / fan_in);
+
+        for group in current.chunks(fan_in) {
+            if group.len() == 1 {
+                next.push(group[0]);
+            } else {
+                let merged = merge_run_group_to_temp(ctx, group, sort_keys)?;
+                next.push(merged);
+            }
+        }
+
+        current = next;
+    }
+
+    Ok(current)
+}
+
+fn merge_run_group_to_temp(
+    ctx: &mut ExecContext,
+    run_ids: &[TempFileId],
+    sort_keys: &[SortKey],
+) -> Result<TempFileId> {
+    debug_assert!(!run_ids.is_empty());
+
+    if run_ids.len() == 1 {
+        return Ok(run_ids[0]);
+    }
+
+    let input_runs = run_ids.to_vec();
+    let block_size = ctx.temp_storage.block_size().max(1);
+    let writer_batch_pages = choose_sort_spill_batch_pages(ctx.sort_run_bytes, block_size);
+    let mut writer = TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch_pages)?;
+    let mut merger = RunMerger::new(ctx, input_runs.clone(), sort_keys.to_vec())?;
+
+    loop {
+        let next_row = {
+            let disk_reader = &mut *ctx.disk_reader;
+            let disk_writer = &mut *ctx.disk_writer;
+            let temp_storage = &*ctx.temp_storage;
+            merger.next_row(temp_storage, disk_reader, disk_writer)?
+        };
+
+        match next_row {
+            Some(row) => writer.append_row(
+                &row,
+                ctx.temp_storage,
+                &mut *ctx.disk_reader,
+                &mut *ctx.disk_writer,
+            )?,
+            None => break,
+        }
+    }
+
+    drop(merger);
+
+    let output_run = writer.finish(
+        ctx.temp_storage,
+        &mut *ctx.disk_reader,
+        &mut *ctx.disk_writer,
+    )?;
+
+    for run_id in input_runs {
+        ctx.temp_storage.delete_temp_file(run_id)?;
+    }
+
+    Ok(output_run)
 }
 
 fn sort_rows(rows: &mut [Row], sort_keys: &[SortKey]) {
@@ -199,7 +305,7 @@ fn compare_rows(sort_keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
 ///
 /// Schema validation at operator construction time guarantees that both sides
 /// have the same type for every sort key, so the cross-type arm (`_ =>`) is
-/// unreachable in practice.  Returning Equal there (instead of propagating a
+/// unreachable in practice. Returning Equal there (instead of propagating a
 /// Result) eliminates all error-machinery overhead from the comparison closure
 /// called O(N log N) times during a sort.
 #[inline]
@@ -241,7 +347,8 @@ impl RunMerger {
         let temp_storage = &*ctx.temp_storage;
 
         for (run_idx, run_id) in run_ids.into_iter().enumerate() {
-            let mut reader = TempRunReader::with_batch_pages(temp_storage, run_id, reader_batch_pages)?;
+            let mut reader =
+                TempRunReader::with_batch_pages(temp_storage, run_id, reader_batch_pages)?;
             if let Some(row) = reader.next_row(temp_storage, disk_reader, disk_writer)? {
                 heap.push(HeapItem {
                     row,

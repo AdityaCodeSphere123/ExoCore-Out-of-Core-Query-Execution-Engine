@@ -38,10 +38,9 @@ impl<'a> Operator for ProjectOperator<'a> {
     }
 
     fn next(&mut self, ctx: &mut ExecContext) -> Result<Option<Row>> {
-        if let Some(row) = self.underlying.next(ctx)? {
-            Ok(Some(row.project_by_indices(&self.indices)?))
-        } else {
-            Ok(None)
+        match self.underlying.next(ctx)? {
+            Some(row) => Ok(Some(row.project_by_indices_owned(&self.indices)?)),
+            None => Ok(None),
         }
     }
 }
