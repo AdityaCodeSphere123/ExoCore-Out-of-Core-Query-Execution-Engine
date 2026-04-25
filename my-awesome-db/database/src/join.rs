@@ -181,10 +181,76 @@ const MIN_HASH_JOIN_PARTITIONS: usize = 8;
 const MAX_HASH_JOIN_PARTITIONS: usize = 32;
 const TARGET_PARTITION_PAGES: usize = 256;
 const HASH_JOIN_MAX_REPARTITION_DEPTH: usize = 3;
-const HASH_JOIN_BUILD_READER_PAGES: usize = 64;
-const HASH_JOIN_PROBE_READER_PAGES: usize = 64;
+const HASH_JOIN_BUILD_READER_PAGES: usize = 128;
+const HASH_JOIN_PROBE_READER_PAGES: usize = 128;
 const HASH_JOIN_BUILD_MISC_RESERVE_BYTES: usize = 256 * 1024;
 const HASH_JOIN_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+// ── Bloom filter ──────────────────────────────────────────────────────────────
+
+/// Size of the per-join Bloom filter in bytes.  2 MB → 16 M bits.
+/// At 7 probes this gives FPR ≈ (1-e^(-7n/16M))^7.
+///   n=135K (typical Q3 build side): FPR < 10^-14  → effectively 0
+///   n=6M   (worst-case same-table): FPR ≈ 15%     → 85% of probe rows skipped
+const BLOOM_FILTER_BYTES: usize = 2 * 1024 * 1024;
+
+struct BloomFilter {
+    bits: Vec<u64>,
+    num_bits: usize,
+}
+
+impl BloomFilter {
+    fn new() -> Self {
+        let num_bits = BLOOM_FILTER_BYTES * 8;
+        let words = (num_bits + 63) / 64;
+        Self {
+            bits: vec![0u64; words],
+            num_bits,
+        }
+    }
+
+    fn insert(&mut self, hash: u64) {
+        let h2 = hash.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let m = self.num_bits;
+        let mut h = hash;
+        for _ in 0..7usize {
+            let bit = (h as usize) % m;
+            self.bits[bit >> 6] |= 1u64 << (bit & 63);
+            h = h.wrapping_add(h2);
+        }
+    }
+
+    fn may_contain(&self, hash: u64) -> bool {
+        let h2 = hash.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let m = self.num_bits;
+        let mut h = hash;
+        for _ in 0..7usize {
+            let bit = (h as usize) % m;
+            if (self.bits[bit >> 6] >> (bit & 63)) & 1 == 0 {
+                return false;
+            }
+            h = h.wrapping_add(h2);
+        }
+        true
+    }
+}
+
+/// Hash the join-key fields of `row` at `indices` into a single u64.
+/// Uses the same logic for left and right rows so that equal key values
+/// always hash to the same number.
+fn compute_join_key_hash(row: &Row, indices: &[usize]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for &i in indices {
+        match &row.values()[i] {
+            Data::Int32(v)  => v.hash(&mut h),
+            Data::Int64(v)  => v.hash(&mut h),
+            Data::Float32(v) => v.to_bits().hash(&mut h),
+            Data::Float64(v) => v.to_bits().hash(&mut h),
+            Data::String(s) => s.hash(&mut h),
+        }
+    }
+    h.finish()
+}
 
 fn choose_num_partitions(ctx: &ExecContext) -> usize {
     let block_size = ctx.temp_storage.block_size();
@@ -198,7 +264,7 @@ fn choose_writer_batch(sort_run_bytes: usize, block_size: usize, num_partitions:
     let budget = sort_run_bytes / 4;
     let per_writer = budget / num_partitions.max(1);
     let batch_pages = per_writer / block_size.max(1);
-    batch_pages.clamp(4, 64)
+    batch_pages.clamp(4, 128)
 }
 
 fn choose_hash_build_budget_bytes(ctx: &ExecContext) -> usize {
@@ -400,6 +466,15 @@ impl<'a> HashJoinOperator<'a> {
         let mut right_writers: Vec<Option<TempRunWriter>> =
             (0..num_partitions).map(|_| None).collect();
 
+        // Build a Bloom filter from all left-side join keys.  When we stream
+        // the right (probe) side, any row whose key hash is absent in the
+        // filter is guaranteed to have no matching left row — skip it
+        // entirely and avoid writing it to a partition file at all.
+        // This is the single biggest I/O win for queries like Q3/Q5/Q20/Q21
+        // where the probe side is lineitem (1333 pages) but only a small
+        // fraction of its rows can ever join with the filtered build side.
+        let mut bloom = BloomFilter::new();
+
         let mut left = self.left.take().expect("left already consumed");
         loop {
             let maybe = left.next(ctx)?;
@@ -407,6 +482,7 @@ impl<'a> HashJoinOperator<'a> {
                 Some(r) => r,
                 None => break,
             };
+            bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
             let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
             if left_writers[part].is_none() {
                 left_writers[part] = Some(TempRunWriter::with_batch_pages(
@@ -430,6 +506,11 @@ impl<'a> HashJoinOperator<'a> {
                 Some(r) => r,
                 None => break,
             };
+            // Bloom filter early-exit: skip rows that definitely have no match.
+            let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
+            if !bloom.may_contain(key_hash) {
+                continue;
+            }
             let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
             if right_writers[part].is_none() {
                 right_writers[part] = Some(TempRunWriter::with_batch_pages(
@@ -445,6 +526,7 @@ impl<'a> HashJoinOperator<'a> {
             )?;
         }
         drop(right);
+        drop(bloom);
 
         let mut tasks = VecDeque::new();
 
