@@ -1,7 +1,7 @@
 use anyhow::Result;
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
@@ -359,6 +359,8 @@ fn build_join_impl<'a>(
             left_key_indices,
             right_key_indices,
             extra_predicates,
+            left_rows_hint,
+            right_rows_hint,
         )?))
     } else {
         Ok(Box::new(BlockNestedLoopJoinOperator::new(
@@ -384,7 +386,7 @@ struct PartitionTask {
 enum ActivePartition {
     Hash {
         task: PartitionTask,
-        build_map: HashMap<JoinKey, Vec<Row>>,
+        build_map: FastHashMap<JoinKey, Vec<Row>>,
         probe_reader: TempRunReader,
         build_is_left: bool,
     },
@@ -406,10 +408,21 @@ pub struct HashJoinOperator<'a> {
     resolved_extra: Vec<ResolvedPredicate>,
     merged_schema: RowSchema,
     state: HashJoinState,
+    left_rows_hint: Option<f64>,
+    right_rows_hint: Option<f64>,
+    /// Rows consumed from build side during a failed in-memory attempt, replayed by partition_inputs.
+    left_prefetched: Vec<Row>,
+    right_prefetched: Vec<Row>,
 }
 
 enum HashJoinState {
     NotStarted,
+    /// Build side fits in memory: hash map resident, probe side streams directly.
+    InMemoryProbing {
+        build_map: FastHashMap<JoinKey, Vec<Row>>,
+        build_is_left: bool,
+        output_buf: Vec<Row>,
+    },
     Probing(ProbingState),
     Done,
 }
@@ -432,6 +445,8 @@ impl<'a> HashJoinOperator<'a> {
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
         extra_predicates: Vec<Predicate>,
+        left_rows_hint: Option<f64>,
+        right_rows_hint: Option<f64>,
     ) -> Result<Self> {
         let left_schema = left.schema().clone();
         let right_schema = right.schema().clone();
@@ -445,6 +460,10 @@ impl<'a> HashJoinOperator<'a> {
             resolved_extra,
             merged_schema,
             state: HashJoinState::NotStarted,
+            left_rows_hint,
+            right_rows_hint,
+            left_prefetched: Vec::new(),
+            right_prefetched: Vec::new(),
         })
     }
 
@@ -475,57 +494,60 @@ impl<'a> HashJoinOperator<'a> {
         // fraction of its rows can ever join with the filtered build side.
         let mut bloom = BloomFilter::new();
 
-        let mut left = self.left.take().expect("left already consumed");
-        loop {
-            let maybe = left.next(ctx)?;
-            let row = match maybe {
-                Some(r) => r,
-                None => break,
-            };
+        // Drain any rows prefetched during a failed in-memory attempt, then read from operator.
+        for row in std::mem::take(&mut self.left_prefetched) {
             bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
             let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
             if left_writers[part].is_none() {
-                left_writers[part] = Some(TempRunWriter::with_batch_pages(
-                    ctx.temp_storage,
-                    writer_batch,
-                )?);
+                left_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
             }
             left_writers[part].as_mut().unwrap().append_row(
-                &row,
-                ctx.temp_storage,
-                &mut *ctx.disk_reader,
-                &mut *ctx.disk_writer,
+                &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
             )?;
         }
-        drop(left);
-
-        let mut right = self.right.take().expect("right already consumed");
-        loop {
-            let maybe = right.next(ctx)?;
-            let row = match maybe {
-                Some(r) => r,
-                None => break,
-            };
-            // Bloom filter early-exit: skip rows that definitely have no match.
-            let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
-            if !bloom.may_contain(key_hash) {
-                continue;
+        if let Some(mut left) = self.left.take() {
+            loop {
+                let maybe = left.next(ctx)?;
+                let row = match maybe { Some(r) => r, None => break };
+                bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
+                let part = partition_hash_with_salt(&row, &self.left_key_indices, num_partitions, 0);
+                if left_writers[part].is_none() {
+                    left_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
+                }
+                left_writers[part].as_mut().unwrap().append_row(
+                    &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
+                )?;
             }
+        }
+
+        // Drain prefetched right rows then read from operator, filtering with bloom.
+        for row in std::mem::take(&mut self.right_prefetched) {
+            let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
+            if !bloom.may_contain(key_hash) { continue; }
             let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
             if right_writers[part].is_none() {
-                right_writers[part] = Some(TempRunWriter::with_batch_pages(
-                    ctx.temp_storage,
-                    writer_batch,
-                )?);
+                right_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
             }
             right_writers[part].as_mut().unwrap().append_row(
-                &row,
-                ctx.temp_storage,
-                &mut *ctx.disk_reader,
-                &mut *ctx.disk_writer,
+                &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
             )?;
         }
-        drop(right);
+        if let Some(mut right) = self.right.take() {
+            loop {
+                let maybe = right.next(ctx)?;
+                let row = match maybe { Some(r) => r, None => break };
+                // Bloom filter early-exit: skip rows that definitely have no match.
+                let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
+                if !bloom.may_contain(key_hash) { continue; }
+                let part = partition_hash_with_salt(&row, &self.right_key_indices, num_partitions, 0);
+                if right_writers[part].is_none() {
+                    right_writers[part] = Some(TempRunWriter::with_batch_pages(ctx.temp_storage, writer_batch)?);
+                }
+                right_writers[part].as_mut().unwrap().append_row(
+                    &row, ctx.temp_storage, &mut *ctx.disk_reader, &mut *ctx.disk_writer,
+                )?;
+            }
+        }
         drop(bloom);
 
         let mut tasks = VecDeque::new();
@@ -776,7 +798,7 @@ impl<'a> HashJoinOperator<'a> {
             build_file,
             HASH_JOIN_BUILD_READER_PAGES,
         )?;
-        let mut build_map: HashMap<JoinKey, Vec<Row>> = HashMap::new();
+        let mut build_map: FastHashMap<JoinKey, Vec<Row>> = FastHashMap::default();
         let mut bytes_used = 0usize;
 
         while let Some(row) = build_reader.next_row(
@@ -857,12 +879,139 @@ impl<'a> Operator for HashJoinOperator<'a> {
         loop {
             match std::mem::replace(&mut self.state, HashJoinState::Done) {
                 HashJoinState::NotStarted => {
-                    let tasks = self.partition_inputs(ctx)?;
-                    self.state = HashJoinState::Probing(ProbingState {
-                        pending_tasks: tasks,
-                        active: None,
-                        output_buf: Vec::new(),
-                    });
+                    let build_budget = choose_hash_build_budget_bytes(ctx);
+                    let left_hint = self.left_rows_hint.unwrap_or(f64::MAX);
+                    let right_hint = self.right_rows_hint.unwrap_or(f64::MAX);
+
+                    // Build side is whichever side is estimated smaller.
+                    let build_is_left = left_hint <= right_hint;
+                    let min_rows = left_hint.min(right_hint);
+
+                    // In-memory hash join is intentionally restricted to tiny
+                    // dimension-side joins. Larger or underestimated inputs must
+                    // fall back to Grace Hash Join, otherwise queries involving
+                    // lineitem/intermediate rows can exceed the memory limit.
+                    const INMEM_MAX_ROWS: f64 = 8_000.0;
+                    const INMEM_BYTES_PER_ROW: usize = 512;
+                    const INMEM_ABSOLUTE_CAP_BYTES: usize = 2 * 1024 * 1024;
+
+                    let inmem_budget = (build_budget / 4).min(INMEM_ABSOLUTE_CAP_BYTES);
+                    let attempt_inmem = min_rows.is_finite()
+                        && min_rows <= INMEM_MAX_ROWS
+                        && (min_rows as usize).saturating_mul(INMEM_BYTES_PER_ROW) <= inmem_budget;
+
+                    if attempt_inmem {
+                        let build_key_indices: Vec<usize> = if build_is_left {
+                            self.left_key_indices.clone()
+                        } else {
+                            self.right_key_indices.clone()
+                        };
+
+                        let mut build_rows: Vec<Row> = Vec::new();
+                        let mut bytes_used = 0usize;
+                        let mut overflowed = false;
+
+                        let mut build_op = if build_is_left {
+                            self.left.take().unwrap()
+                        } else {
+                            self.right.take().unwrap()
+                        };
+
+                        loop {
+                            let Some(row) = build_op.next(ctx)? else { break };
+                            let row_bytes = row
+                                .estimate_heap_size()
+                                .saturating_add(HASH_JOIN_ENTRY_OVERHEAD_BYTES);
+
+                            if bytes_used.saturating_add(row_bytes) > inmem_budget {
+                                // Keep the row already consumed, but do NOT drain
+                                // the remaining build operator into memory. Put the
+                                // operator back below and let partition_inputs stream it.
+                                build_rows.push(row);
+                                overflowed = true;
+                                break;
+                            }
+
+                            bytes_used = bytes_used.saturating_add(row_bytes);
+                            build_rows.push(row);
+                        }
+
+                        if !overflowed {
+                            let mut build_map: FastHashMap<JoinKey, Vec<Row>> = FastHashMap::default();
+                            for row in build_rows {
+                                let key = make_key(&row, &build_key_indices);
+                                build_map.entry(key).or_default().push(row);
+                            }
+                            self.state = HashJoinState::InMemoryProbing {
+                                build_map,
+                                build_is_left,
+                                output_buf: Vec::new(),
+                            };
+                        } else {
+                            // Replay only the few rows consumed before overflow,
+                            // then continue streaming the rest through Grace Hash Join.
+                            if build_is_left {
+                                self.left = Some(build_op);
+                                self.left_prefetched = build_rows;
+                            } else {
+                                self.right = Some(build_op);
+                                self.right_prefetched = build_rows;
+                            }
+                            let tasks = self.partition_inputs(ctx)?;
+                            self.state = HashJoinState::Probing(ProbingState {
+                                pending_tasks: tasks,
+                                active: None,
+                                output_buf: Vec::new(),
+                            });
+                        }
+                    } else {
+                        let tasks = self.partition_inputs(ctx)?;
+                        self.state = HashJoinState::Probing(ProbingState {
+                            pending_tasks: tasks,
+                            active: None,
+                            output_buf: Vec::new(),
+                        });
+                    }
+                }
+
+                HashJoinState::InMemoryProbing { build_map, build_is_left, mut output_buf } => {
+                    if let Some(row) = output_buf.pop() {
+                        self.state = HashJoinState::InMemoryProbing { build_map, build_is_left, output_buf };
+                        return Ok(Some(row));
+                    }
+
+                    // Pull next probe row directly from the live operator.
+                    let probe_row = if build_is_left {
+                        self.right.as_mut().unwrap().next(ctx)?
+                    } else {
+                        self.left.as_mut().unwrap().next(ctx)?
+                    };
+
+                    match probe_row {
+                        None => {
+                            self.state = HashJoinState::Done;
+                        }
+                        Some(probe_row) => {
+                            let key = if build_is_left {
+                                make_key(&probe_row, &self.right_key_indices)
+                            } else {
+                                make_key(&probe_row, &self.left_key_indices)
+                            };
+                            if let Some(build_rows_match) = build_map.get(&key) {
+                                for build_row in build_rows_match {
+                                    let merged = if build_is_left {
+                                        Row::merge(build_row, &probe_row)
+                                    } else {
+                                        Row::merge(&probe_row, build_row)
+                                    };
+                                    if eval_resolved(&merged, &self.resolved_extra)? {
+                                        output_buf.push(merged);
+                                    }
+                                }
+                            }
+                            self.state = HashJoinState::InMemoryProbing { build_map, build_is_left, output_buf };
+                        }
+                    }
                 }
 
                 HashJoinState::Done => return Ok(None),
