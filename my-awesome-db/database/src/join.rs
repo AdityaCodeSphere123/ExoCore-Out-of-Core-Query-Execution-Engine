@@ -1448,7 +1448,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
 }
 // ── Block Nested-Loop Join (fallback for non-equi conditions) ───────────────
 
-const MAX_BNLJ_OUTER_BATCH_PAGES: usize = 64;
+const MAX_BNLJ_OUTER_BATCH_PAGES: usize = 512;
 
 fn choose_bnlj_outer_batch_bytes(ctx: &ExecContext) -> usize {
     let block_size = ctx.temp_storage.block_size().max(1);

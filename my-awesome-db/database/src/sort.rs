@@ -10,9 +10,9 @@ use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter, TempStorageManager};
 
-const MAX_SORT_SPILL_BATCH_PAGES: usize = 512;
-const MAX_SORT_MERGE_READER_PAGES: usize = 128;
-const MAX_SORT_MERGE_TOTAL_READER_PAGES: usize = 128;
+const MAX_SORT_SPILL_BATCH_PAGES: usize = 2048;
+const MAX_SORT_MERGE_READER_PAGES: usize = 512;
+const MAX_SORT_MERGE_TOTAL_READER_PAGES: usize = 512;
 const MIN_SORT_MERGE_READER_PAGES: usize = 8;
 const SORT_MISC_RESERVE_BYTES: usize = 256 * 1024;
 

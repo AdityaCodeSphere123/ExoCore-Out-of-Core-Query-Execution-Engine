@@ -11,7 +11,7 @@ use crate::filter::{eval_resolved, resolve_predicates, ResolvedPredicate};
 use crate::operator::Operator;
 use crate::row::{Row, RowSchema};
 
-const SCAN_PREFETCH_BLOCKS: usize = 128;
+const SCAN_PREFETCH_BLOCKS: usize = 512;
 
 pub fn get_table_spec<'a>(ctx: &'a DbContext, table_id: &str) -> Result<&'a TableSpec> {
     ctx.get_table_specs()
