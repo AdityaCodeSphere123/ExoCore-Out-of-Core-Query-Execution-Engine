@@ -1,3 +1,5 @@
+// This file implements filtering logic, including predicate evaluation and selection operators.
+
 use anyhow::{anyhow, Result};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
@@ -6,10 +8,7 @@ use std::cmp::Ordering;
 use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 
-// ── resolved predicates (pre-computed column indices) ───────────────────────
-
-/// A predicate with column names resolved to integer indices so that per-row
-/// evaluation is O(1) instead of a linear scan through column names.
+/// A predicate where column names are already resolved to schema indices for fast evaluation.
 pub struct ResolvedPredicate {
     left_idx: usize,
     operator: ComparisionOperator,
@@ -21,8 +20,7 @@ enum ResolvedRhs {
     Literal(Data),
 }
 
-/// Resolve a slice of predicates against a schema, converting column names
-/// to integer indices.  Returns an error if any column name is missing.
+/// Resolves high-level predicates into an efficient internal representation.
 pub fn resolve_predicates(
     schema: &RowSchema,
     predicates: &[Predicate],
@@ -48,15 +46,11 @@ pub fn resolve_predicates(
         .collect()
 }
 
-/// Evaluate pre-resolved predicates against a row using direct index access.
-///
-/// Column indices were validated against the schema at construction time
-/// (`resolve_predicates`), so out-of-bounds access is a programming error and
-/// we skip the `get().ok_or_else()` indirection in the hot path.
+/// Evaluates resolved predicates against a row. Returns true if the row satisfies all conditions.
 pub fn eval_resolved(row: &Row, preds: &[ResolvedPredicate]) -> Result<bool> {
     let values = row.values();
     for pred in preds {
-        // Safety: index validated by resolve_predicates at operator construction.
+
         debug_assert!(pred.left_idx < values.len(), "left_idx {} oob (len {})", pred.left_idx, values.len());
         let lv = &values[pred.left_idx];
         let rv = match &pred.right {
@@ -87,13 +81,6 @@ pub fn eval_resolved(row: &Row, preds: &[ResolvedPredicate]) -> Result<bool> {
     Ok(true)
 }
 
-/// Evaluate predicates against two row halves *without* allocating a merged
-/// `Row`.  Used by `BlockNestedLoopJoinOperator` to avoid the `Row::merge`
-/// clone cost for every (inner, outer) pair that will be filtered out.
-///
-/// `left_len` is the number of columns contributed by `left`; predicate column
-/// indices < `left_len` index into `left`, indices >= `left_len` index into
-/// `right` (offset by `left_len`).
 pub fn eval_resolved_two_parts(
     left: &Row,
     right: &Row,
@@ -159,8 +146,7 @@ fn compare_data_fast(left: &Data, right: &Data) -> Result<Ordering> {
     }
 }
 
-// ── filter operator ─────────────────────────────────────────────────────────
-
+/// The physical filter operator that discards rows not meeting the criteria.
 pub struct FilterOperator<'a> {
     underlying: Box<dyn Operator + 'a>,
     resolved: Vec<ResolvedPredicate>,

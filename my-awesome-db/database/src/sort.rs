@@ -1,3 +1,5 @@
+// Implements external sorting logic for processing data that exceeds available memory.
+
 use anyhow::Result;
 use common::query::SortSpec;
 use common::Data;
@@ -17,11 +19,14 @@ const MIN_SORT_MERGE_READER_PAGES: usize = 8;
 const SORT_MISC_RESERVE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
+/// Specifies how a column should be used for sorting.
 pub struct SortKey {
     pub idx: usize,
     pub ascending: bool,
 }
 
+/// An operator that sorts an input relation.
+/// It uses an external merge sort algorithm if the data doesn't fit in memory.
 pub struct SortOperator<'a> {
     underlying: Box<dyn Operator + 'a>,
     schema: RowSchema,
@@ -58,6 +63,7 @@ impl<'a> SortOperator<'a> {
         })
     }
 
+    /// Consumes all input rows and produces sorted runs.
     fn prepare(&mut self, ctx: &mut ExecContext) -> Result<()> {
         let row_budget = sort_row_budget_bytes(ctx);
         let mut rows: Vec<Row> = Vec::new();
@@ -96,11 +102,6 @@ impl<'a> SortOperator<'a> {
 
             drop(rows);
 
-            // If too many initial runs are handed directly to the final merger,
-            // each TempRunReader gets a tiny batch. That hurts the disk simulator
-            // because reads bounce across many temp files. Grouped merge collapses
-            // runs in passes until the final fan-in is small enough for each reader
-            // to receive a decent batch size.
             let final_run_ids = collapse_runs_for_grouped_merge(ctx, run_ids, &self.sort_keys)?;
             self.output = SortOutput::External(RunMerger::new(
                 ctx,
@@ -182,9 +183,6 @@ fn choose_sort_merge_fan_in(ctx: &ExecContext) -> usize {
         .saturating_div(block_size)
         .max(1);
 
-    // Keep at least MIN_SORT_MERGE_READER_PAGES pages per active run whenever
-    // possible. With the default 128-page total reader budget and an 8-page
-    // minimum, this gives fan-in 16.
     total_reader_pages
         .saturating_div(MIN_SORT_MERGE_READER_PAGES)
         .max(2)
@@ -286,9 +284,7 @@ fn sort_rows(rows: &mut [Row], sort_keys: &[SortKey]) {
 }
 
 fn compare_rows(sort_keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
-    // Access the value slices once outside the loop to avoid repeated method
-    // dispatch, and index directly (panics on OOB — indices are validated at
-    // SortOperator construction time so this cannot happen).
+
     let a_vals = a.values();
     let b_vals = b.values();
     for key in sort_keys {
@@ -301,13 +297,6 @@ fn compare_rows(sort_keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
     Ordering::Equal
 }
 
-/// Infallible comparison used in the sort hot-path.
-///
-/// Schema validation at operator construction time guarantees that both sides
-/// have the same type for every sort key, so the cross-type arm (`_ =>`) is
-/// unreachable in practice. Returning Equal there (instead of propagating a
-/// Result) eliminates all error-machinery overhead from the comparison closure
-/// called O(N log N) times during a sort.
 #[inline]
 fn compare_data_ord(left: &Data, right: &Data) -> Ordering {
     match (left, right) {
@@ -320,6 +309,7 @@ fn compare_data_ord(left: &Data, right: &Data) -> Ordering {
     }
 }
 
+/// Merges multiple sorted runs using a binary heap (priority queue).
 struct RunMerger {
     readers: Vec<TempRunReader>,
     heap: BinaryHeap<HeapItem>,

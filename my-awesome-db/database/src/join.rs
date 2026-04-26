@@ -1,3 +1,5 @@
+// This file implements join operators, including Grace Hash Join and Block Nested Loop Join.
+
 use anyhow::Result;
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use common::Data;
@@ -8,6 +10,7 @@ use crate::operator::{ExecContext, Operator};
 use crate::row::{Row, RowSchema};
 use crate::temp_storage::{TempFileId, TempRunReader, TempRunWriter};
 
+// Custom hasher and hash map for optimized join operations.
 type FastHashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
 
 #[derive(Default)]
@@ -30,8 +33,6 @@ impl std::hash::Hasher for FastHasher {
     fn write_u8(&mut self, i: u8) { self.write(&[i]); }
     fn write_u16(&mut self, i: u16) { self.write(&i.to_le_bytes()); }
 
-    /// Unrolled 4-byte FNV — eliminates loop overhead and the `to_le_bytes()`
-    /// stack allocation.  Called on every integer join-key hash during probing.
     #[inline]
     fn write_u32(&mut self, i: u32) {
         const P: u64 = 0x100000001b3;
@@ -43,7 +44,6 @@ impl std::hash::Hasher for FastHasher {
         self.state = h;
     }
 
-    /// Unrolled 8-byte FNV.
     #[inline]
     fn write_u64(&mut self, i: u64) {
         const P: u64 = 0x100000001b3;
@@ -68,9 +68,8 @@ impl std::hash::Hasher for FastHasher {
     fn finish(&self) -> u64 { self.state }
 }
 
-// ── join key ─────────────────────────────────────────────────────────────────
-
-/// A row's join-key values, comparable and hashable.
+/// Represents a key used for joining two tables. 
+/// Supports single-column and multi-column (composite) keys.
 #[derive(Eq, PartialEq, Clone)]
 enum JoinKey {
     One(KeyField),
@@ -95,7 +94,7 @@ impl std::hash::Hash for JoinKey {
 enum KeyField {
     I32(i32),
     I64(i64),
-    F32(u32), // stored as bits so that bit-equal floats hash equally
+    F32(u32), 
     F64(u64),
     Str(String),
 }
@@ -153,9 +152,6 @@ fn estimate_join_key_heap_size(key: &JoinKey) -> usize {
     }
 }
 
-/// Compute partition number directly from row values.
-/// Avoids allocating a JoinKey (Vec + String clones) during the partitioning
-/// phase where we only need the hash, not a comparable key.
 fn partition_hash_with_salt(
     row: &Row,
     indices: &[usize],
@@ -185,14 +181,9 @@ const HASH_JOIN_PROBE_READER_PAGES: usize = 128;
 const HASH_JOIN_BUILD_MISC_RESERVE_BYTES: usize = 256 * 1024;
 const HASH_JOIN_ENTRY_OVERHEAD_BYTES: usize = 64;
 
-// ── Bloom filter ──────────────────────────────────────────────────────────────
-
-/// Size of the per-join Bloom filter in bytes.  2 MB → 16 M bits.
-/// At 7 probes this gives FPR ≈ (1-e^(-7n/16M))^7.
-///   n=135K (typical Q3 build side): FPR < 10^-14  → effectively 0
-///   n=6M   (worst-case same-table): FPR ≈ 15%     → 85% of probe rows skipped
 const BLOOM_FILTER_BYTES: usize = 2 * 1024 * 1024;
 
+/// A Bloom Filter used to quickly filter out rows that definitely won't match.
 struct BloomFilter {
     bits: Vec<u64>,
     num_bits: usize,
@@ -234,9 +225,6 @@ impl BloomFilter {
     }
 }
 
-/// Hash the join-key fields of `row` at `indices` into a single u64.
-/// Uses the same logic for left and right rows so that equal key values
-/// always hash to the same number.
 fn compute_join_key_hash(row: &Row, indices: &[usize]) -> u64 {
     let mut h = DefaultHasher::new();
     for &i in indices {
@@ -257,8 +245,6 @@ fn choose_num_partitions(ctx: &ExecContext) -> usize {
     (ctx.sort_run_bytes / target_bytes).clamp(MIN_HASH_JOIN_PARTITIONS, MAX_HASH_JOIN_PARTITIONS)
 }
 
-/// Compute writer batch pages from available memory and partition count.
-/// Larger batches → fewer, bigger contiguous extents → fewer seeks during probe.
 fn choose_writer_batch(sort_run_bytes: usize, block_size: usize, num_partitions: usize) -> usize {
     let budget = sort_run_bytes / 4;
     let per_writer = budget / num_partitions.max(1);
@@ -276,10 +262,7 @@ fn choose_hash_build_budget_bytes(ctx: &ExecContext) -> usize {
         .max(block_size)
 }
 
-// ── entry point ───────────────────────────────────────────────────────────────
-
-/// Classify predicates into equi-join keys and residual predicates.
-/// Returns (left_key_indices, right_key_indices, extra_predicates).
+/// Analyzes join predicates to identify equi-join keys and residual filters.
 fn split_join_predicates(
     left_schema: &RowSchema,
     right_schema: &RowSchema,
@@ -315,8 +298,6 @@ fn split_join_predicates(
     (left_key_indices, right_key_indices, extra_predicates)
 }
 
-/// Build a join operator without row-count hints.  Picks Grace Hash Join for
-/// equi-join predicates; falls back to Block Nested Loop otherwise.
 pub fn build_join<'a>(
     left: Box<dyn Operator + 'a>,
     right: Box<dyn Operator + 'a>,
@@ -325,10 +306,6 @@ pub fn build_join<'a>(
     build_join_impl(left, right, predicates, None, None)
 }
 
-/// Same as `build_join` but accepts estimated row counts for both sides.
-/// Used by the SPJ planner which has per-leaf statistics available.  The hints
-/// are forwarded to `BlockNestedLoopJoinOperator` so it can choose which side
-/// to spill (inner) and which to batch in memory (outer).
 pub fn build_join_hinted<'a>(
     left: Box<dyn Operator + 'a>,
     right: Box<dyn Operator + 'a>,
@@ -372,8 +349,6 @@ fn build_join_impl<'a>(
     }
 }
 
-// ── Grace Hash Join ───────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy)]
 struct PartitionTask {
     left_file: TempFileId,
@@ -399,6 +374,8 @@ enum ActivePartition {
     },
 }
 
+/// An operator that performs a Hash Join.
+/// It attempts an in-memory join first, then falls back to Grace Hash Join (partitioning).
 pub struct HashJoinOperator<'a> {
     left: Option<Box<dyn Operator + 'a>>,
     right: Option<Box<dyn Operator + 'a>>,
@@ -409,14 +386,14 @@ pub struct HashJoinOperator<'a> {
     state: HashJoinState,
     left_rows_hint: Option<f64>,
     right_rows_hint: Option<f64>,
-    /// Rows consumed from build side during a failed in-memory attempt, replayed by partition_inputs.
+
     left_prefetched: Vec<Row>,
     right_prefetched: Vec<Row>,
 }
 
 enum HashJoinState {
     NotStarted,
-    /// Build side fits in memory: hash map resident, probe side streams directly.
+
     InMemoryProbing {
         build_map: FastHashMap<JoinKey, Vec<Row>>,
         build_is_left: bool,
@@ -466,11 +443,7 @@ impl<'a> HashJoinOperator<'a> {
         })
     }
 
-    /// Partition both inputs into temp files, but create writers lazily so we
-    /// never pay memory or temp-file overhead for untouched partitions.
-    ///
-    /// We also only keep partitions where both sides are non-empty. One-sided
-    /// partitions can never produce output, so we discard them before probing.
+    /// Partitions the input relations into smaller chunks based on the join key.
     fn partition_inputs(&mut self, ctx: &mut ExecContext) -> Result<VecDeque<PartitionTask>> {
         let num_partitions = choose_num_partitions(ctx);
         let writer_batch = choose_writer_batch(
@@ -484,17 +457,6 @@ impl<'a> HashJoinOperator<'a> {
         let mut right_writers: Vec<Option<TempRunWriter>> =
             (0..num_partitions).map(|_| None).collect();
 
-        // Build Bloom from the estimated smaller side.
-        //
-        // Old behavior:
-        //   always build Bloom from left, filter right.
-        //
-        // New behavior:
-        //   if left is estimated smaller/equal: build Bloom from left, filter right.
-        //   if right is estimated smaller:      build Bloom from right, filter left.
-        //
-        // If hints are missing, preserve the old left-Bloom behavior unless only
-        // the right side has a hint.
         let bloom_from_left = match (self.left_rows_hint, self.right_rows_hint) {
             (Some(l), Some(r)) => l <= r,
             (Some(_), None) => true,
@@ -505,11 +467,7 @@ impl<'a> HashJoinOperator<'a> {
         let mut bloom = BloomFilter::new();
 
         if bloom_from_left {
-            // ------------------------------------------------------------
-            // Case 1: Build Bloom from LEFT, filter RIGHT.
-            // ------------------------------------------------------------
 
-            // Drain any left rows prefetched during a failed in-memory attempt.
             for row in std::mem::take(&mut self.left_prefetched) {
                 bloom.insert(compute_join_key_hash(&row, &self.left_key_indices));
 
@@ -535,7 +493,6 @@ impl<'a> HashJoinOperator<'a> {
                 )?;
             }
 
-            // Stream remaining left input.
             if let Some(mut left) = self.left.take() {
                 loop {
                     let maybe = left.next(ctx)?;
@@ -569,7 +526,6 @@ impl<'a> HashJoinOperator<'a> {
                 }
             }
 
-            // Drain prefetched right rows, filtering with Bloom.
             for row in std::mem::take(&mut self.right_prefetched) {
                 let key_hash = compute_join_key_hash(&row, &self.right_key_indices);
                 if !bloom.may_contain(key_hash) {
@@ -598,7 +554,6 @@ impl<'a> HashJoinOperator<'a> {
                 )?;
             }
 
-            // Stream remaining right input, filtering with Bloom.
             if let Some(mut right) = self.right.take() {
                 loop {
                     let maybe = right.next(ctx)?;
@@ -635,11 +590,7 @@ impl<'a> HashJoinOperator<'a> {
                 }
             }
         } else {
-            // ------------------------------------------------------------
-            // Case 2: Build Bloom from RIGHT, filter LEFT.
-            // ------------------------------------------------------------
 
-            // Drain any right rows prefetched during a failed in-memory attempt.
             for row in std::mem::take(&mut self.right_prefetched) {
                 bloom.insert(compute_join_key_hash(&row, &self.right_key_indices));
 
@@ -665,7 +616,6 @@ impl<'a> HashJoinOperator<'a> {
                 )?;
             }
 
-            // Stream remaining right input.
             if let Some(mut right) = self.right.take() {
                 loop {
                     let maybe = right.next(ctx)?;
@@ -699,7 +649,6 @@ impl<'a> HashJoinOperator<'a> {
                 }
             }
 
-            // Drain prefetched left rows, filtering with Bloom.
             for row in std::mem::take(&mut self.left_prefetched) {
                 let key_hash = compute_join_key_hash(&row, &self.left_key_indices);
                 if !bloom.may_contain(key_hash) {
@@ -728,7 +677,6 @@ impl<'a> HashJoinOperator<'a> {
                 )?;
             }
 
-            // Stream remaining left input, filtering with Bloom.
             if let Some(mut left) = self.left.take() {
                 loop {
                     let maybe = left.next(ctx)?;
@@ -1105,14 +1053,9 @@ impl<'a> Operator for HashJoinOperator<'a> {
                     let left_hint = self.left_rows_hint.unwrap_or(f64::MAX);
                     let right_hint = self.right_rows_hint.unwrap_or(f64::MAX);
 
-                    // Build side is whichever side is estimated smaller.
                     let build_is_left = left_hint <= right_hint;
                     let min_rows = left_hint.min(right_hint);
 
-                    // In-memory hash join is intentionally restricted to tiny
-                    // dimension-side joins. Larger or underestimated inputs must
-                    // fall back to Grace Hash Join, otherwise queries involving
-                    // lineitem/intermediate rows can exceed the memory limit.
                     const INMEM_MAX_ROWS: f64 = 8_000.0;
                     const INMEM_BYTES_PER_ROW: usize = 512;
                     const INMEM_ABSOLUTE_CAP_BYTES: usize = 2 * 1024 * 1024;
@@ -1226,8 +1169,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                             if let Some(build_rows_match) = build_map.get(&key) {
                                 for build_row in build_rows_match {
                                     if build_is_left {
-                                        // Original order: left = build_row, right = probe_row.
-                                        // Evaluate residual predicates before allocating merged row.
+
                                         if self.resolved_extra.is_empty()
                                             || eval_resolved_two_parts(
                                                 build_row,
@@ -1239,7 +1181,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                             output_buf.push(Row::merge(build_row, &probe_row));
                                         }
                                     } else {
-                                        // Original order: left = probe_row, right = build_row.
+
                                         if self.resolved_extra.is_empty()
                                             || eval_resolved_two_parts(
                                                 &probe_row,
@@ -1318,7 +1260,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                     if let Some(build_rows) = build_map.get(&key) {
                                         for build_row in build_rows {
                                             if build_is_left {
-                                                // Original order: left = build_row, right = probe_row.
+
                                                 if self.resolved_extra.is_empty()
                                                     || eval_resolved_two_parts(
                                                         build_row,
@@ -1330,7 +1272,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                                     ps.output_buf.push(Row::merge(build_row, &probe_row));
                                                 }
                                             } else {
-                                                // Original order: left = probe_row, right = build_row.
+
                                                 if self.resolved_extra.is_empty()
                                                     || eval_resolved_two_parts(
                                                         &probe_row,
@@ -1375,7 +1317,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                 Some(inner_row) => {
                                     for outer_row in outer_batch.iter().rev() {
                                         if inner_is_left {
-                                            // Original order: left = inner_row, right = outer_row.
+
                                             if self.resolved_extra.is_empty()
                                                 || eval_resolved_two_parts(
                                                     &inner_row,
@@ -1387,7 +1329,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
                                                 ps.output_buf.push(Row::merge(&inner_row, outer_row));
                                             }
                                         } else {
-                                            // Original order: left = outer_row, right = inner_row.
+
                                             if self.resolved_extra.is_empty()
                                                 || eval_resolved_two_parts(
                                                     outer_row,
@@ -1446,7 +1388,6 @@ impl<'a> Operator for HashJoinOperator<'a> {
         }
     }
 }
-// ── Block Nested-Loop Join (fallback for non-equi conditions) ───────────────
 
 const MAX_BNLJ_OUTER_BATCH_PAGES: usize = 512;
 
@@ -1457,26 +1398,14 @@ fn choose_bnlj_outer_batch_bytes(ctx: &ExecContext) -> usize {
     batch_pages * block_size
 }
 
-/// Out-of-core block nested loop join used when no equi-join predicate exists.
-///
-/// Strategy:
-///   1. Identify the "inner" side (smaller, spilled once to temp storage) and
-///      the "outer" side (larger, read in memory-sized batches).  When row-count
-///      hints are provided, we spill whichever side has fewer rows; otherwise we
-///      default to spilling left.  Spilling the smaller side minimises the
-///      number of disk pages read per outer batch.
-///   2. For each outer batch, re-scan the full inner file and evaluate
-///      predicates against every (inner, outer) pair.
-///
-/// Output column order is always [original_left | original_right] regardless
-/// of which side was chosen as inner.
+/// A Block Nested-Loop Join operator.
+/// Used as a fallback when no equi-join predicates are available.
 pub struct BlockNestedLoopJoinOperator<'a> {
-    /// Spilled side — scanned once per outer batch.
+
     inner: Option<Box<dyn Operator + 'a>>,
-    /// Batched side — loaded into memory in chunks.
+
     outer: Option<Box<dyn Operator + 'a>>,
-    /// True when the original *left* operand was chosen as inner.  Used to
-    /// restore [left | right] column order when merging rows.
+
     inner_is_left: bool,
     resolved: Vec<ResolvedPredicate>,
     merged_schema: RowSchema,
@@ -1633,8 +1562,7 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
                         Some(inner_row) => {
                             for outer_row in outer_batch.iter().rev() {
                                 if self.inner_is_left {
-                                    // Original order: left = inner_row, right = outer_row.
-                                    // Evaluate predicates before allocating merged row.
+
                                     if self.resolved.is_empty()
                                         || eval_resolved_two_parts(
                                             &inner_row,
@@ -1646,7 +1574,7 @@ impl<'a> Operator for BlockNestedLoopJoinOperator<'a> {
                                         output_buf.push(Row::merge(&inner_row, outer_row));
                                     }
                                 } else {
-                                    // Original order: left = outer_row, right = inner_row.
+
                                     if self.resolved.is_empty()
                                         || eval_resolved_two_parts(
                                             outer_row,

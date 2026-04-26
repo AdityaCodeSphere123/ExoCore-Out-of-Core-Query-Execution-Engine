@@ -1,3 +1,5 @@
+// This file implements a memory buffer for holding and managing data pages in memory.
+
 use anyhow::{bail, Result};
 
 pub struct BlockBuffer<'a> {
@@ -101,7 +103,7 @@ impl<'a> BlockBuffer<'a> {
             bail!("unterminated string while skipping in row decode");
         }
 
-        *offset += 1; // skip null terminator
+        *offset += 1; 
         Ok(())
     }
 }

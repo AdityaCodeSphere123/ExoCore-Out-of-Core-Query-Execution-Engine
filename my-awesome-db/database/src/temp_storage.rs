@@ -1,3 +1,5 @@
+// Manages temporary files and runs used during out-of-core operations like sorting and joins.
+
 use anyhow::{anyhow, bail, Result};
 use common::Data;
 use std::collections::HashMap;
@@ -33,12 +35,7 @@ pub struct TempStorageManager {
     next_file_id: u64,
     next_free_block: Option<u64>,
     files: HashMap<TempFileId, TempFileMeta>,
-    /// Extents returned by `delete_temp_file`, available for reuse.
-    /// Each entry is (start_block, num_pages).  Without recycling, every
-    /// deleted temp file's disk space is lost for the lifetime of the query
-    /// (next_free_block only ever grows).  This is especially costly for
-    /// Grace Hash Join which creates and immediately discards ~64 partition
-    /// files per join operator.
+
     free_extents: Vec<(u64, u64)>,
 }
 
@@ -73,8 +70,7 @@ impl TempStorageManager {
             .files
             .remove(&file_id)
             .ok_or_else(|| anyhow!("unknown temp file id {}", file_id.0))?;
-        // Return all extents to the free list.  Subsequent allocations will
-        // reuse them before extending the anonymous disk region.
+
         for extent in meta.extents {
             self.free_extents.push((extent.start_block, extent.num_pages));
         }
@@ -238,11 +234,6 @@ impl TempStorageManager {
             bail!("cannot allocate zero-page extent");
         }
 
-        // Check the free list before consuming new disk space.
-        //   Best-fit: pick the smallest free extent that is >= num_pages.
-        //   This minimises leftover fragments compared with first-fit, keeping
-        //   the free list compact and future allocations more likely to be
-        //   contiguous — which reduces rotational latency during reads.
         let best_pos = self
             .free_extents
             .iter()
@@ -254,7 +245,7 @@ impl TempStorageManager {
         let start_block = if let Some(pos) = best_pos {
             let (start, total) = self.free_extents.swap_remove(pos);
             if total > num_pages {
-                // Put the leftover pages back as a smaller free extent.
+
                 self.free_extents.push((start + num_pages, total - num_pages));
             }
             start
@@ -342,12 +333,6 @@ impl TempStorageManager {
     }
 }
 
-/// A writer for a single sorted run in temp storage.
-///
-/// Unlike `TempRunReader`, this struct does NOT borrow `TempStorageManager`.
-/// Instead, `storage` is passed as a parameter to each method.  This lets
-/// multiple `TempRunWriter`s coexist (needed during Grace Hash Join
-/// partitioning where we maintain one writer per partition simultaneously).
 pub struct TempRunWriter {
     file_id: TempFileId,
     io_batch_pages: usize,

@@ -1,3 +1,5 @@
+// This file manages multiple buffers, handling allocation, eviction, and synchronization with disk.
+
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
@@ -14,8 +16,7 @@ pub struct BufferManager {
     frames: Vec<Option<Frame>>,
     page_table: HashMap<u64, usize>,
     fifo_queue: VecDeque<u64>,
-    // Indices of frames that have never held a page (or were freed).
-    // Popping here is O(1) vs the previous O(capacity) linear scan.
+
     free_frames: VecDeque<usize>,
 }
 

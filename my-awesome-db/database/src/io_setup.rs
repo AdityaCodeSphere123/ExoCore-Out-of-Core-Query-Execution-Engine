@@ -1,3 +1,5 @@
+// This file handles the setup and configuration of I/O parameters for the database engine.
+
 use std::{
     io::{Read, Write},
     os::fd::RawFd,

@@ -1,3 +1,5 @@
+// Implements the projection operator for selecting specific columns from input rows.
+
 use anyhow::Result;
 
 use crate::operator::{ExecContext, Operator};

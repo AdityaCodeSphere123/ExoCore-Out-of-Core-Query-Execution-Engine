@@ -1,3 +1,5 @@
+// This file implements the query execution engine that coordinates operators to process queries.
+
 use anyhow::{anyhow, Result};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate, Query, QueryOp, SortSpec};
 use db_config::DbContext;
@@ -16,6 +18,7 @@ use crate::sort;
 use crate::temp_storage::TempStorageManager;
 
 #[derive(Debug, Clone, Default)]
+/// A catalog containing statistics about tables and columns to aid in query planning.
 pub struct StatsCatalog {
     tables: HashMap<String, TableStats>,
 }
@@ -200,6 +203,7 @@ fn value_as_f64(value: &Value) -> Option<f64> {
     }
 }
 
+/// Executes a query and writes the results to the monitor writer.
 pub fn execute_query<RDisk, WDisk, WMon>(
     ctx: &DbContext,
     query: &Query,
@@ -226,11 +230,6 @@ where
         sort_run_bytes,
     };
 
-    // monitor_out is a raw file-descriptor writer with no OS-level buffering.
-    // Writing one row at a time would issue one syscall per row; for large
-    // result sets this dominates.  Accumulate into a 128 KB batch buffer and
-    // flush in bulk — reduces syscall count by ~1000× and eliminates the
-    // per-row String heap allocation from to_pipe_string().
     const OUTPUT_BATCH_BYTES: usize = 128 * 1024;
     monitor_writer.write_all(b"validate\n")?;
     let mut row_buf = String::with_capacity(OUTPUT_BATCH_BYTES + 512);
@@ -250,6 +249,7 @@ where
     Ok(())
 }
 
+/// Converts a logical query operation tree into a physical operator tree.
 fn execute_op_tree<'a>(
     ctx: &DbContext,
     op: &'a QueryOp,
@@ -317,6 +317,7 @@ fn execute_op_tree<'a>(
     }
 }
 
+/// Constructs a scan operator with optimizations like column pruning and ordered bounds.
 fn build_scan_operator<'a>(
     ctx: &DbContext,
     scan_data: &'a common::query::ScanData,
@@ -518,6 +519,7 @@ fn tighter_upper(
     }
 }
 
+/// Attempts to build an optimized plan for Select-Project-Join (SPJ) query blocks.
 fn try_build_flattened_spj_plan<'a>(
     ctx: &DbContext,
     cross_root: &'a common::query::CrossData,
@@ -573,12 +575,11 @@ fn try_build_flattened_spj_plan<'a>(
     let mut current_subset: Vec<usize> = Vec::new();
     let mut current_mask: usize = 0;
     let mut current_plan: Option<Box<dyn Operator + 'a>> = None;
-    // Running row-count estimate for the accumulated left-side plan.  Used to
-    // give BNLJ a hint about which side to spill (the smaller one).
+
     let mut current_rows: f64 = 1.0;
 
     for &leaf_idx in &order {
-        // Estimate rows for this leaf after applying its local predicates.
+
         let leaf_base = estimate_base_rows_for_leaf(leaves[leaf_idx].op, stats_catalog)
             .unwrap_or(DEFAULT_BASE_REL_ROWS);
         let leaf_sel = estimate_local_selectivity_for_leaf(
@@ -608,15 +609,12 @@ fn try_build_flattened_spj_plan<'a>(
         };
 
         current_plan = Some(if let Some(left_plan) = current_plan {
-            // Pass row-count hints so BNLJ can pick the smaller side to spill.
+
             join::build_join_hinted(left_plan, leaf_plan, &join_preds, current_rows, leaf_rows)?
         } else {
             leaf_plan
         });
 
-        // Update the accumulated row estimate for the next join step.
-        // Use the same density-based estimate that the DP optimizer used so
-        // that the BNLJ spill hint is consistent with the chosen plan.
         if current_subset.is_empty() {
             current_rows = leaf_rows;
         } else {
@@ -839,12 +837,11 @@ fn classify_predicates<'a>(
     let mut residual_predicates = Vec::new();
 
     for pred in predicates {
-        // Count how many leaves own the left-hand column.
+
         let left_owners = count_column_owners(&pred.column_name, leaves);
         match left_owners {
             0 => {
-                // Column is not present in any leaf — we cannot safely
-                // classify this predicate.  Fall back to the simpler plan.
+
                 return Ok(None);
             }
             1 => {
@@ -880,15 +877,14 @@ fn classify_predicates<'a>(
                                     });
                                 }
                             }
-                            // Right column is ambiguous — can't push into
-                            // either leaf; evaluate after all joins instead.
+
                             _ => residual_predicates.push(pred.clone()),
                         }
                     }
                     _ => local_predicates[left_owner].push(pred.clone()),
                 }
             }
-            // Left column is ambiguous — evaluate after all joins.
+
             _ => residual_predicates.push(pred.clone()),
         }
     }
@@ -900,7 +896,6 @@ fn classify_predicates<'a>(
     }))
 }
 
-/// Returns how many leaves contain `column_name` in their schema.
 fn count_column_owners<'a>(column_name: &str, leaves: &[SpjLeaf<'a>]) -> usize {
     leaves.iter().filter(|l| l.schema.contains(column_name)).count()
 }
@@ -1218,11 +1213,6 @@ fn estimate_leaf_access_stats<'a>(
     let selectivity = estimate_local_selectivity_for_leaf(leaves[leaf_idx].op, &local_predicates[leaf_idx], stats_catalog);
     let rows = (base_rows * selectivity).max(1.0);
 
-    // If a range predicate targets a physically-ordered column we can skip
-    // blocks that fall outside the predicate range.  Model this by scaling the
-    // page estimate by the fraction of blocks we actually need to read (the
-    // range selectivity).  This gives the join-order optimizer a realistic
-    // picture of how cheap such a scan really is.
     let scan_fraction = ordered_scan_fraction(
         leaves[leaf_idx].op,
         &local_predicates[leaf_idx],
@@ -1240,15 +1230,6 @@ fn estimate_leaf_access_stats<'a>(
     }
 }
 
-/// Returns the fraction of blocks that must be read when one or more range
-/// predicates target a physically-ordered column.  Returns 1.0 (full scan)
-/// when no such predicate exists.
-///
-/// When `IsPhysicallyOrdered` is true the data is stored sorted on that
-/// column, so a range predicate `col > X` only needs to touch the tail of the
-/// file rather than every block.  We use the range selectivity (derived from
-/// `RangeStat`) as a proxy for this fraction.  The minimum over all ordered
-/// range predicates is used when several such predicates are present.
 fn ordered_scan_fraction(
     op: &QueryOp,
     predicates: &[Predicate],
@@ -1321,12 +1302,7 @@ fn estimate_join_step<'a>(
     let join_work = if has_equi {
         left.pages + right.pages + output_pages
     } else {
-        // BNLJ: the smaller side is spilled once (inner) and the larger side is
-        // loaded in batches (outer).  Each outer batch re-scans the full inner.
-        //   cost = inner_spill + outer_read + num_passes * inner_read + output
-        // where num_passes = ceil(outer.pages / batch_size).
-        // This is far cheaper than the naive left.pages * right.pages estimate
-        // because the outer side is processed in large memory-sized chunks.
+
         let (inner_pages, outer_pages) = if left.pages <= right.pages {
             (left.pages, right.pages)
         } else {
@@ -1428,17 +1404,12 @@ fn estimate_predicate_selectivity(
 fn estimate_eq_literal_selectivity(col_stats: Option<&ColumnStats>, row_count: f64) -> f64 {
     if let Some(stats) = col_stats {
         if let Some(density) = stats.density {
-            // DensityStat = fraction of rows with a unique value, so
-            // NDV = row_count * density.
+
             let ndv = (row_count * density).max(1.0);
             return (1.0 / ndv).clamp(MIN_SELECTIVITY, 1.0_f64);
         }
     }
-    // No DensityStat available.  The flat 10% default is far too high for any
-    // large table (e.g. TPC-H lineitem has ~6M rows; 10% = 600k matches for an
-    // equality predicate, which is absurd).  Use sqrt(row_count) as a rough NDV
-    // estimate — this gives ~1/2449 for lineitem, orders of magnitude more
-    // realistic and produces much better join-order decisions.
+
     let ndv = row_count.sqrt().max(1.0);
     (1.0 / ndv).clamp(MIN_SELECTIVITY, 1.0_f64)
 }
@@ -1570,10 +1541,7 @@ fn estimate_equi_join_selectivity<'a>(
     leaves: &[SpjLeaf<'a>],
     stats_catalog: &StatsCatalog,
 ) -> Option<f64> {
-    // `info.left_leaf` / `info.right_leaf` are sorted by leaf index (smaller,
-    // larger) and do NOT necessarily correspond to the two sides of the
-    // predicate.  `predicate.column_name` may belong to *either* leaf, so we
-    // consult the schemas to find the correct owner before resolving.
+
     let pred_col_leaf = if leaves[info.left_leaf].schema.contains(&info.predicate.column_name) {
         info.left_leaf
     } else {
@@ -1638,9 +1606,7 @@ const NE_PRED_SELECTIVITY: f64 = 0.90;
 const RANGE_PRED_SELECTIVITY: f64 = 0.33;
 const EQ_JOIN_SELECTIVITY: f64 = 0.001;
 const OTHER_JOIN_SELECTIVITY: f64 = 0.10;
-// Expected BNLJ outer-batch size (pages) used for cost estimation.  Matches
-// MAX_BNLJ_OUTER_BATCH_PAGES in join.rs so the cost model reflects the actual
-// execution behaviour after the batch-size increase.
+
 const BNLJ_COST_BATCH_PAGES: f64 = 512.0;
 
 fn add_predicate_columns(

@@ -1,3 +1,5 @@
+// This file contains the command-line interface logic for interacting with the database.
+
 use std::path::PathBuf;
 
 #[derive(clap::Parser, Debug)]

@@ -1,10 +1,9 @@
+// Defines the Row structure and schema, providing methods for row manipulation and serialization.
+
 use anyhow::{anyhow, bail, Result};
 use common::Data;
 use std::collections::HashMap;
 
-// RowSchema stores a HashMap alongside the Vec so that index_of / contains are
-// O(1) instead of O(n).  This matters because these are called on every row
-// during filter evaluation, join key resolution, and column-pruning.
 #[derive(Debug, Clone)]
 pub struct RowSchema {
     column_names: Vec<String>,
@@ -120,12 +119,10 @@ impl Row {
     pub fn project_by_indices_owned(self, indices: &[usize]) -> Result<Row> {
         let Row { values } = self;
 
-        // Fast path 1: identity projection — return values unchanged.
         if indices.len() == values.len() && indices.iter().enumerate().all(|(i, &idx)| i == idx) {
             return Ok(Row::new(values));
         }
 
-        // Fast path 2: sorted unique indices.
         if indices.windows(2).all(|w| w[0] < w[1]) {
             let mut out = Vec::with_capacity(indices.len());
             let mut src = values.into_iter().enumerate();
@@ -144,7 +141,6 @@ impl Row {
             return Ok(Row::new(out));
         }
 
-        // Fallback: allow duplicates / arbitrary order by cloning.
         let mut out = Vec::with_capacity(indices.len());
         for &idx in indices {
             out.push(
@@ -172,13 +168,9 @@ impl Row {
         Row::new(vals)
     }
 
-    /// Estimate the total heap memory this row occupies, including the Vec
-    /// backing store and any String heap allocations.  Used by sort and join
-    /// operators to budget memory usage.  Previously duplicated in sort.rs and
-    /// join.rs; canonical home is here.
     pub fn estimate_heap_size(&self) -> usize {
         use std::mem::size_of;
-        // Row struct + Vec<Data> elements + Vec allocator metadata
+
         let mut total = size_of::<Row>() + self.values.len() * size_of::<Data>() + 16;
         for value in &self.values {
             if let Data::String(s) = value {
@@ -188,9 +180,6 @@ impl Row {
         total
     }
 
-    /// Append this row's pipe-delimited representation to an existing String.
-    /// Callers should prefer this over `to_pipe_string` when a reusable buffer
-    /// is available — it eliminates the per-row heap allocation entirely.
     pub fn append_pipe_to(&self, out: &mut String) {
         use std::fmt::Write as FmtWrite;
         for val in &self.values {

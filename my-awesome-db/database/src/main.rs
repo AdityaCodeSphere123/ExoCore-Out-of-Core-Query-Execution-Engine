@@ -1,3 +1,5 @@
+// The main entry point of the database application, initializing components and starting the server/CLI.
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::Query;

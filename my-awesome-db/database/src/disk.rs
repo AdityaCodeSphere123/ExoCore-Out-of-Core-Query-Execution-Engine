@@ -1,3 +1,5 @@
+// This file provides low-level disk I/O operations for reading and writing data blocks.
+
 use anyhow::{anyhow, Result};
 use common::{Data, DataType};
 use db_config::table::TableSpec;
@@ -46,11 +48,9 @@ pub struct OrderedScanBounds {
 pub struct ScanOperator {
     table_id: String,
     schema: RowSchema,
-    /// Per-column keep flag for late materialization. Empty = keep all columns.
+
     keep_columns: Vec<bool>,
-    /// Local single-relation predicates fused into the scan itself. These are
-    /// resolved against the scan's output schema after column pruning, so rows
-    /// that fail never enter the higher operator pipeline.
+
     scan_filter: Vec<ResolvedPredicate>,
     ordered_bounds: Option<OrderedScanBounds>,
     start_block: Option<u64>,
@@ -59,15 +59,10 @@ pub struct ScanOperator {
     current_rows: Option<std::vec::IntoIter<Row>>,
     prefetched_rows: VecDeque<std::vec::IntoIter<Row>>,
 
-    /// Reused read buffer for scan prefetch batches.
-    /// Avoids allocating a fresh Vec<u8> on every refill.
     batch_buf: Vec<u8>,
 
-    /// Cached decode plan for this scan's projected columns.
-    /// Built once after we know the table spec and keep_columns.
     decode_plan: Option<Vec<ColDecodeOp>>,
 
-    /// Number of output columns produced by decode_plan.
     num_kept: usize,
 }
 
@@ -409,11 +404,6 @@ fn decode_block_into_rows_with_plan(
     Ok(rows)
 }
 
-/// A pre-compiled per-column decode action.  Built once before the row loop so
-/// the inner loop only dispatches on this small enum, avoiding the per-row
-/// `keep` slice lookup and `DataType` match on every column of every row.
-/// Consecutive skipped fixed-width columns are merged into a single `SkipFixed`
-/// entry so only one bounds check is needed for the whole run.
 #[derive(Clone, Copy)]
 enum ColDecodeOp {
     KeepI32,
@@ -464,7 +454,6 @@ fn build_col_decode_plan(table_spec: &TableSpec, keep: Option<&[bool]>) -> Vec<C
     }
     plan
 }
-
 
 fn restrict_scan_range<RDisk, WDisk>(
     table_spec: &TableSpec,
