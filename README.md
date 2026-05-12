@@ -1,6 +1,7 @@
-# Out-of-Core Query Execution Engine
+# Exocore
+**High-Performance Out-of-Core Query Execution Engine**
 
-A high-performance query execution engine written in Rust, designed for **Out-of-Core** data processing. This system is built to handle datasets that exceed physical memory (RAM) by efficiently managing disk I/O and implementing external memory algorithms.
+Exocore is a high-performance query execution engine written in Rust, designed to handle massive datasets that exceed physical memory (RAM). By implementing specialized external-memory algorithms and a high-fidelity HDD simulator, Exocore masters the art of moving data between disk and processor with minimal latency.
 
 **Link**: [Assignment Specification](https://messy-circle-aa4.notion.site/COL362-632-Assignment-3-Out-of-Core-Query-Execution-3236f1adfa0a80b9a9e4ca3492cb5efb)  
 **Course**: COL362 (Database Management Systems)  
