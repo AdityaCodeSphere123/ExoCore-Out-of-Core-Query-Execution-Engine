@@ -1,103 +1,107 @@
-# Out-of-Core Query Execution
+# Out-of-Core Query Execution Engine
 
-Link: https://messy-circle-aa4.notion.site/COL362-632-Assignment-3-Out-of-Core-Query-Execution-3236f1adfa0a80b9a9e4ca3492cb5efb
+A high-performance query execution engine written in Rust, designed for **Out-of-Core** data processing. This system is built to handle datasets that exceed physical memory (RAM) by efficiently managing disk I/O and implementing external memory algorithms.
 
-This assignment is for COL362.
+**Link**: [Assignment Specification](https://messy-circle-aa4.notion.site/COL362-632-Assignment-3-Out-of-Core-Query-Execution-3236f1adfa0a80b9a9e4ca3492cb5efb)  
+**Course**: COL362 (Database Management Systems)  
+**Authors**: Aditya Anand and Ahilaan Saxena (IIT Delhi)
 
-Authors: Aditya Anand and Ahilaan Saxena (IIT Delhi)
+---
 
-First build your query in demo_query_printer/src/main.rs then run:
+## 🏗 System Architecture
+
+The project is structured as a multi-process system to isolate concerns and accurately simulate physical hardware constraints.
+
+- **`database`**: The core query engine. It implements operators like Scan, Filter, Project, Sort, and Cross-Join. It operates under strict memory limits enforced via `setrlimit`.
+- **`disk`**: A physical disk simulator. It models a Hard Disk Drive (HDD) with configurable parameters for seek time, rotational latency, and transfer rates, providing a realistic benchmark for I/O-bound queries.
+- **`monitor`**: The orchestrator. It spawns the database and disk processes, facilitates communication via Unix pipes, collects performance metrics, and validates the output against expected results.
+- **`generator`**: A utility to transform raw datasets (like TPC-H) into the engine's optimized binary format. It also generates a SQLite database for ground-truth validation.
+- **`demo_query_printer`**: A DSL for constructing query plans in JSON format.
+
+---
+
+## 🚀 Getting Started
+
+### 1. Prerequisites
+- Rust (latest stable)
+- SQLite3 (for generating validation data)
+- TPC-H dataset (CSV/TBL format)
+
+### 2. Data Generation
+First, you need to compile your raw data into binary format and generate the necessary configurations.
+```bash
+cd my-awesome-db
+cargo run -r --bin generator -- all \
+    --dataset-folder ../path/to/tpch/raw \
+    --compiled-dataset-folder ../scratch/compiled_datasets/tpch \
+    --runtime-folder ../scratch/runtimes/tpch \
+    --build-path ./target/release \
+    --block-size 4096
+```
+
+### 3. Define a Query
+Use the `demo_query_printer` to build your query plan. Modify `demo_query_printer/src/main.rs` to define your desired plan:
+```rust
+let query = QueryOp::scan("customer")
+    .cross(QueryOp::scan("orders"))
+    .filter("c_custkey", ComparisionOperator::EQ, ComparisionValue::Column("o_custkey".to_string()))
+    .sort("c_custkey", true)
+    .build();
+```
+Then run it to get the JSON:
+```bash
 cargo run -r --bin demo_query_printer
+```
 
-Copy the printed query in the terminal to the "query" field of scratch/runtimes/tpch/monitor_config.json and set disabled to false and change expected output file accordingly
+### 4. Configuration
+Copy the printed JSON into the `query` field of `scratch/runtimes/tpch/monitor_config.json`. Ensure the query is enabled:
+```json
+{
+  "execution_name": "Join Query",
+  "disabled": false,
+  "query": { ... your query json ... },
+  "expected_output_file": "scratch/runtimes/tpch/expected_1.csv",
+  "memory_limit_mb": 64
+}
+```
 
-Write your query in my_query.sql and run:
+### 5. Generate Expected Output (Ground Truth)
+Use SQLite to generate the correct results for validation:
+```bash
 sqlite3 scratch/compiled_datasets/tpch/sqlite.db < my_query.sql > scratch/runtimes/tpch/expected_1.csv
+```
 
-SELECT *,''
-FROM customer
-CROSS JOIN orders
-WHERE c_custkey = o_custkey ORDER BY c_custkey;
+### 6. Run and Monitor
+Execute the query through the monitor to see performance metrics:
+```bash
+cargo run -r --bin monitor -- --config scratch/runtimes/tpch/monitor_config.json
+```
+Detailed metrics will be saved to `disk_io_metrics.csv`.
 
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 24107,
-    total_writes: 19178,
-    total_blocks_processed: 43285,
-    total_cylinders_traveled: 21411854,
-    total_io_time_us: 100997961,
-    total_seek_time_us: 20457638,
-    total_rotational_latency_us: 79358340,
-    total_transfer_time_us: 1181983,
-}
+---
 
-# batched temp storage 
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 9867,
-    total_writes: 4938,
-    total_blocks_processed: 43285,
-    total_cylinders_traveled: 6218286,
-    total_io_time_us: 35326175,
-    total_seek_time_us: 7294199,
-    total_rotational_latency_us: 26850002,
-    total_transfer_time_us: 1181974,
-}
+## ⚡ Performance Optimizations
 
-# scan prefetch
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 5247,
-    total_writes: 4938,
-    total_blocks_processed: 43285,
-    total_cylinders_traveled: 1422962,
-    total_io_time_us: 25204602,
-    total_seek_time_us: 3872628,
-    total_rotational_latency_us: 20150002,
-    total_transfer_time_us: 1181972,
-} 
+The engine implements several advanced techniques to minimize Disk I/O and CPU overhead:
 
-# claude optimizations
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 2854,
-    total_writes: 2545,
-    total_blocks_processed: 43285,
-    total_cylinders_traveled: 1420404,
-    total_io_time_us: 15979846,
-    total_seek_time_us: 2368707,
-    total_rotational_latency_us: 12429168,
-    total_transfer_time_us: 1181971,
-}
+- **Scan Prefetching**: Background threads fetch data blocks before they are requested by the execution operators, hiding disk latency.
+- **Batched Temp Storage**: Intermediate runs during external sorting are written in large, contiguous blocks to reduce disk head movement.
+- **Optimized Join Algorithms**: Implements memory-efficient join strategies suitable for out-of-core execution.
+- **Custom Buffer Management**: A specialized buffer manager designed to interface with the disk simulator's block-based API.
 
-# optimized join
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 2677,
-    total_writes: 2368,
-    total_blocks_processed: 42855,
-    total_cylinders_traveled: 1855391,
-    total_io_time_us: 15335025,
-    total_seek_time_us: 2018962,
-    total_rotational_latency_us: 12145834,
-    total_transfer_time_us: 1170229,
-} 
+---
 
-# claude optimizations p2
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 1530,
-    total_writes: 928,
-    total_blocks_processed: 42859,
-    total_cylinders_traveled: 238466,
-    total_io_time_us: 5857977,
-    total_seek_time_us: 825139,
-    total_rotational_latency_us: 3862500,
-    total_transfer_time_us: 1170337,
-}
+## 📊 Benchmarking Results
 
-# idk what 
-Disk IO metrics DiskIOMetricsResult {
-    total_reads: 932,
-    total_writes: 330,
-    total_blocks_processed: 42859,
-    total_cylinders_traveled: 237680,
-    total_io_time_us: 3423203,
-    total_seek_time_us: 373700,
-    total_rotational_latency_us: 1879167,
-    total_transfer_time_us: 1170337,
-}
+The following table summarizes the improvement across various optimization stages (measured in total I/O time):
+
+| Optimization Stage | Total Reads | Total Writes | Cylinders Traveled | Total I/O Time (us) |
+| :--- | :--- | :--- | :--- | :--- |
+| Baseline | 24,107 | 19,178 | 21,411,854 | 100,997,961 |
+| Batched Temp Storage | 9,867 | 4,938 | 6,218,286 | 35,326,175 |
+| Scan Prefetch | 5,247 | 4,938 | 1,422,962 | 25,204,602 |
+| Optimized Join | 2,677 | 2,368 | 1,855,391 | 15,335,025 |
+| Full Optimizations | 932 | 330 | 237,680 | 3,423,203 |
+
+> [!NOTE]
+> Metrics were collected using the custom Disk Simulator, modeling a disk with 7200 RPM and 8.5ms average seek time.
